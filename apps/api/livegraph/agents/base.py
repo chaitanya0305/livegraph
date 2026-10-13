@@ -128,7 +128,7 @@ async def stream_structured(
             except Exception:  # partial objects may be incomplete; skip unrenderable frames
                 continue
             if len(text) > len(sent):
-                on_delta(text[len(sent) :] if text.startswith(sent) else text[len(sent) :])
+                on_delta(text[len(sent) :])  # append-only renderers: the new tail
                 sent = text
         output = await res.get_output()
         usage = res.usage

@@ -672,8 +672,10 @@ class RunScheduler:
         return e
 
     def _planner_deps(self, plan_id: UUID) -> plan_mod.PlannerDeps:
+        me = asyncio.current_task()  # the plan node task (tools may run in their own tasks)
+
         def guard() -> None:
-            if not self._still_mine(plan_id):
+            if self.tasks.get(plan_id) is not me:
                 raise asyncio.CancelledError()
 
         async def add_node(key: str, type: str, title: str, question: str | None = None, instructions: str | None = None) -> str:
