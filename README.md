@@ -16,6 +16,17 @@ make dev                                    # postgres :5433, api :8000, web :30
 ```
 To demo the UI without a backend or API key: `cd apps/web && npm run dev:mock`.
 
+## Run it in Docker
+```bash
+cp apps/api/.env.example apps/api/.env      # add OPENROUTER_API_KEY (and LOGFIRE_TOKEN if wanted)
+make up                                     # builds livegraph-api + livegraph-web, starts db/api/web
+make logs                                   # follow api + web logs
+make down
+```
+Then open http://localhost:3000. Keys are passed into the api container from `apps/api/.env` at runtime
+and are never copied into an image. `NEXT_PUBLIC_API_URL` is baked into the web image at build time
+(default `http://localhost:8000`); rebuild with a different `args` value in `docker-compose.yml` to host elsewhere.
+
 ## Test
 ```bash
 make test     # backend pytest (offline, fake models) and web typecheck

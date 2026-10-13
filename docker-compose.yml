@@ -14,5 +14,38 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+
+  api:
+    build: ./apps/api
+    image: livegraph-api
+    # keys + model settings from apps/api/.env (gitignored); only the DB host differs inside compose
+    env_file: ./apps/api/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://livegraph:livegraph@db:5432/livegraph
+      CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  web:
+    build:
+      context: ./apps/web
+      args:
+        # the browser calls the API directly, so this is the host-visible URL
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    image: livegraph-web
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+
 volumes:
   pgdata:
