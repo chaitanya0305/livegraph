@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     provider_fast: str = "baidu/fp8"
     # Hidden reasoning on the fast tier (DeepSeek reasons by default and it ~4x the tokens/latency)
     reasoning_fast: bool = False
+    # Fast-tier node types that reason anyway (comma-separated), e.g. the debate agents
+    reasoning_nodes: str = "prosecutor,defender"
     # How the fast tier returns structured output: "prompted" (JSON in the text stream) or "tool" (tool-call
     # arguments). DeepSeek on OpenRouter generates tool-call arguments ~3x slower than plain text.
     output_mode_fast: str = "prompted"

@@ -71,16 +71,24 @@ def smart() -> Model:
     return _overrides.get("smart") or _openrouter(settings.model_smart, settings.provider_smart)
 
 
-def fast() -> Model:
+def fast(reasoning: bool | None = None) -> Model:
     if "fast" in _overrides:
         return _overrides["fast"]
-    model = _openrouter(settings.model_fast, settings.provider_fast, settings.reasoning_fast)
+    if reasoning is None:
+        reasoning = settings.reasoning_fast
+    model = _openrouter(settings.model_fast, settings.provider_fast, reasoning)
     if settings.output_mode_fast == "prompted":
         _prompted_models.add(id(model))
     return model
 
 
+def reasoning_node_types() -> set[str]:
+    return {t.strip() for t in settings.reasoning_nodes.split(",") if t.strip()}
+
+
 def model_for(node_type: str, tier: Tier) -> Model:
     if node_type in _overrides:
         return _overrides[node_type]
-    return smart() if tier == "smart" else fast()
+    if tier == "smart":
+        return smart()
+    return fast(reasoning=True if node_type in reasoning_node_types() else None)
