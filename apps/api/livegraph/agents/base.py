@@ -19,8 +19,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import BaseModel
-from pydantic_ai import Agent
+from pydantic_ai import Agent, PromptedOutput
 from pydantic_ai.models import Model
+
+from livegraph.agents.models import uses_prompted_output
 
 
 @dataclass
@@ -121,7 +123,10 @@ async def stream_structured(
     debounce: float | None = 0.05,
 ) -> AgentResult:
     sent = ""
-    async with agent.run_stream(prompt, model=model, deps=deps) as res:
+    run_kwargs: dict[str, Any] = {}
+    if uses_prompted_output(model):
+        run_kwargs["output_type"] = PromptedOutput(agent.output_type)
+    async with agent.run_stream(prompt, model=model, deps=deps, **run_kwargs) as res:
         async for partial in res.stream_output(debounce_by=debounce):
             try:
                 text = render(partial)

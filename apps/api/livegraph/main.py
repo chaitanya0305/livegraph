@@ -16,6 +16,7 @@ from livegraph.api import api_router
 from livegraph.config import settings
 from livegraph.db import base as db_base
 from livegraph.engine import EngineError, engine
+from livegraph.observability import setup_logfire
 
 log = logging.getLogger("livegraph")
 
@@ -50,6 +51,7 @@ def create_app(*, use_lifespan: bool = True) -> FastAPI:
         return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
 
     app.include_router(api_router)
+    setup_logfire(app)
     return app
 
 

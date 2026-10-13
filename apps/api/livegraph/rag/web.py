@@ -77,6 +77,15 @@ def parse_citations(message: Any) -> list[dict]:
     return out
 
 
+def _web_body(max_results: int) -> dict:
+    body: dict = {"plugins": [{"id": "web", "max_results": max_results}]}
+    if settings.provider_fast:
+        body["provider"] = {"order": [settings.provider_fast], "allow_fallbacks": True}
+    if not settings.reasoning_fast:
+        body["reasoning"] = {"enabled": False}
+    return body
+
+
 async def web_research(session: AsyncSession, *, run_id: UUID, query: str, max_results: int = 5) -> list[Document]:
     """Search the web through OpenRouter and ingest each cited page as Document(origin="web").
 
@@ -99,7 +108,7 @@ async def web_research(session: AsyncSession, *, run_id: UUID, query: str, max_r
                 },
                 {"role": "user", "content": query},
             ],
-            extra_body={"plugins": [{"id": "web", "max_results": max_results}]},
+            extra_body=_web_body(max_results),
         )
         choices = getattr(resp, "choices", None) or _as_dict(resp).get("choices") or []
         if not choices:

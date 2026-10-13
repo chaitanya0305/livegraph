@@ -11,6 +11,7 @@ os.environ["DATABASE_URL"] = f"postgresql+asyncpg://livegraph:livegraph@localhos
 os.environ["OPENROUTER_API_KEY"] = ""
 os.environ["WEB_SEARCH"] = "off"
 os.environ["PYDANTIC_AI_NO_BANNER"] = "1"
+os.environ["LOGFIRE_TOKEN"] = ""
 
 
 async def _ensure_db() -> None:

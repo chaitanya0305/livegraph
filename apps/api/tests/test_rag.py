@@ -353,7 +353,7 @@ async def test_web_research_parses_citations(session, monkeypatch):
 
     call = client.calls[0]
     assert call["model"] == settings.model_fast
-    assert call["extra_body"] == {"plugins": [{"id": "web", "max_results": 4}]}
+    assert call["extra_body"]["plugins"] == [{"id": "web", "max_results": 4}]
     assert [d.source_url for d in docs] == ["https://nrel.gov/pv", "https://x.com/a"]
     assert all(d.origin == "web" and d.run_id == run_id for d in docs)
     assert docs[0].title == "NREL Efficiency Chart"
