@@ -1,0 +1,18 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: livegraph
+      POSTGRES_PASSWORD: livegraph
+      POSTGRES_DB: livegraph
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U livegraph"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+volumes:
+  pgdata:
