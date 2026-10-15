@@ -10,6 +10,8 @@ _ADMIN_DSN = "postgresql://livegraph:livegraph@localhost:5433/livegraph"
 os.environ["DATABASE_URL"] = f"postgresql+asyncpg://livegraph:livegraph@localhost:5433/{TEST_DB}"
 os.environ["OPENROUTER_API_KEY"] = ""
 os.environ["WEB_SEARCH"] = "off"
+os.environ["EXA_API_KEY"] = ""  # never call Exa from tests, even when apps/api/.env has a key
+os.environ["WEB_PROVIDER"] = "auto"
 os.environ["PYDANTIC_AI_NO_BANNER"] = "1"
 os.environ["LOGFIRE_TOKEN"] = ""
 

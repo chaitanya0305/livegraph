@@ -1,4 +1,4 @@
-"""FastAPI app factory + lifespan (pgvector extension, create_all, crash recovery)."""
+"""FastAPI app factory + lifespan (Alembic migrations, crash recovery)."""
 
 from __future__ import annotations
 
@@ -8,28 +8,19 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy import text
 
-import livegraph.db.models  # noqa: F401  (registers core + rag tables on Base.metadata)
-import livegraph.rag.models  # noqa: F401
 from livegraph.api import api_router
 from livegraph.config import settings
-from livegraph.db import base as db_base
+from livegraph.db.migrate import migrate
 from livegraph.engine import EngineError, engine
 from livegraph.observability import setup_logfire
 
 log = logging.getLogger("livegraph")
 
 
-async def init_db() -> None:
-    async with db_base.engine.begin() as conn:
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        await conn.run_sync(db_base.Base.metadata.create_all)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
+    await migrate()  # alembic upgrade head (stamps a pre-Alembic database at the baseline first)
     # Simple restart recovery: runs that were planning/running when the process died become `paused`.
     await engine.recover()
     yield

@@ -1,4 +1,21 @@
 import {
+  BookOpen,
+  CircleCheck,
+  FileSearch,
+  FileText,
+  Files,
+  GitBranchPlus,
+  Globe,
+  Link,
+  MessagesSquare,
+  Network,
+  Plus,
+  Route,
+  Send,
+  TextSearch,
+  Undo2,
+  Spline,
+  Wrench,
   FileQuestion,
   Gavel,
   ListChecks,
@@ -11,7 +28,8 @@ import {
   Shield,
   Swords,
 } from "lucide-react";
-import type { EventType, NodeStatus, NodeType, RunStatus, VersionReason } from "@/lib/protocol";
+import type { ActivityStep } from "@/lib/reducer";
+import type { EventType, NodeStatus, NodeType, RunStatus, ToolName, TraceStep, VersionReason } from "@/lib/protocol";
 
 export const NODE_TYPE: Record<NodeType, { icon: LucideIcon; label: string }> = {
   plan: { icon: ListTree, label: "Planner" },
@@ -26,6 +44,81 @@ export const NODE_TYPE: Record<NodeType, { icon: LucideIcon; label: string }> = 
 };
 
 export const nodeTypeMeta = (t: string) => NODE_TYPE[t as NodeType] ?? { icon: FileQuestion, label: t };
+
+export interface ToolMeta {
+  icon: LucideIcon;
+  /** present-tense verb phrase; `{agent}` is replaced with the target agent */
+  verb: string;
+  /** noun used in one-line trace summaries ("3 searches · 1 rebuttal"); null = not counted */
+  noun: [singular: string, plural: string] | null;
+}
+
+export const TOOL_META: Record<ToolName, ToolMeta> = {
+  web_search: { icon: Globe, verb: "Searching the web", noun: ["web search", "web searches"] },
+  search_documents: { icon: FileSearch, verb: "Searching documents", noun: ["search", "searches"] },
+  read_source: { icon: BookOpen, verb: "Reading source", noun: ["read", "reads"] },
+  fetch_page: { icon: Link, verb: "Fetching page", noun: ["page fetch", "page fetches"] },
+  ask_rebuttal: { icon: MessagesSquare, verb: "Asking {agent}", noun: ["rebuttal", "rebuttals"] },
+  request_follow_up_research: { icon: GitBranchPlus, verb: "Requesting follow-up", noun: ["follow-up", "follow-ups"] },
+  add_node: { icon: Plus, verb: "Adding step", noun: ["step added", "steps added"] },
+  add_edge: { icon: Spline, verb: "Connecting steps", noun: null },
+  finish_plan: { icon: CircleCheck, verb: "Finishing plan", noun: null },
+  list_documents: { icon: Files, verb: "Listing documents", noun: ["listing", "listings"] },
+  list_agent_runs: { icon: Network, verb: "Listing upstream agents", noun: null },
+  read_agent_output: { icon: FileText, verb: "Reading upstream output", noun: ["upstream read", "upstream reads"] },
+  read_agent_trace: { icon: Route, verb: "Reading upstream trace", noun: ["trace read", "trace reads"] },
+  recall: { icon: Undo2, verb: "Recalling earlier result", noun: ["recall", "recalls"] },
+  search_context: { icon: TextSearch, verb: "Searching shared context", noun: ["context search", "context searches"] },
+  request_upstream_work: { icon: Send, verb: "Asking upstream to redo", noun: ["upstream request", "upstream requests"] },
+};
+
+/** Tools that read other agents' work (their steps carry `reads`). */
+export const CONTEXT_TOOLS = new Set<string>([
+  "list_agent_runs",
+  "read_agent_output",
+  "read_agent_trace",
+  "recall",
+  "search_context",
+]);
+
+export function toolMeta(tool: string): ToolMeta {
+  return TOOL_META[tool as ToolName] ?? { icon: Wrench, verb: tool.replace(/_/g, " "), noun: ["tool call", "tool calls"] };
+}
+
+/** "Asking prosecutor" for ask_rebuttal; plain verb otherwise. `target` = the agent being asked. */
+export function toolVerb(tool: string, target?: string | null): string {
+  const v = toolMeta(tool).verb;
+  return v.replace("{agent}", target ? target : "agent");
+}
+
+/** Who an ask_rebuttal call is addressed to (args.side, or the first exchange's recipient). */
+export function stepTarget(step: ActivityStep): string | null {
+  const side = step.args?.side;
+  if (typeof side === "string") return side;
+  return step.exchange[0]?.to_agent ?? null;
+}
+
+/** "Searching the web: 'solid-state yields' · 3/5" */
+export function stepLine(step: ActivityStep): string {
+  const verb = toolVerb(step.tool, stepTarget(step));
+  const args = step.args_summary ? `: '${step.args_summary}'` : "";
+  const count = step.step && step.budget ? ` · ${step.step}/${step.budget}` : "";
+  return `${verb}${args}${count}`;
+}
+
+/** One-line summary of a trace, e.g. "3 searches · 1 rebuttal". Empty string for no steps. */
+export function traceSummary(trace: readonly TraceStep[]): string {
+  const counts = new Map<string, { n: number; noun: [string, string] }>();
+  for (const st of trace) {
+    const noun = toolMeta(st.tool).noun;
+    if (!noun) continue;
+    const key = noun[0];
+    const c = counts.get(key) ?? { n: 0, noun };
+    c.n++;
+    counts.set(key, c);
+  }
+  return [...counts.values()].map((c) => `${c.n} ${c.n === 1 ? c.noun[0] : c.noun[1]}`).join(" · ");
+}
 
 export const NODE_STATUS_LABEL: Record<NodeStatus, string> = {
   pending: "Pending",
@@ -100,6 +193,10 @@ export function eventColor(t: EventType): string {
     case "retrieval.done":
     case "document.updated":
       return "var(--teal)";
+    case "tool.call":
+    case "tool.result":
+    case "agent.message":
+      return "var(--sky)";
     case "error":
       return "var(--red)";
     default:
@@ -114,6 +211,7 @@ export const EVENT_GROUPS: { label: string; color: string }[] = [
   { label: "claims", color: "var(--violet)" },
   { label: "steer / input", color: "var(--amber)" },
   { label: "sources", color: "var(--teal)" },
+  { label: "tools", color: "var(--sky)" },
   { label: "error", color: "var(--red)" },
 ];
 

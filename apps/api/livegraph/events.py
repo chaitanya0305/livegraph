@@ -129,6 +129,15 @@ class EventBus:
             )
             self._fanout(env)
 
+    def delta_reset(self, run_id: UUID, node_id: UUID, text: str) -> None:
+        """Replace the node's live buffer with ``text`` (streamed output superseded). Unsent deltas are dropped."""
+        self.drop_deltas(run_id, node_id)
+        env = EventEnvelope(
+            seq=None, run_id=run_id, type="node.delta", node_id=node_id,
+            payload={"text": text, "reset": True}, ts=datetime.now(UTC),
+        )
+        self._fanout(env)
+
     async def flush_deltas(self, run_id: UUID, node_id: UUID) -> None:
         key = (run_id, node_id)
         t = self._delta_tasks.pop(key, None)

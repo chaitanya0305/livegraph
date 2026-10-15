@@ -8,13 +8,46 @@ from sqlalchemy import func, select
 
 from livegraph import rag
 from livegraph.db import base as db_base
-from livegraph.db.models import Edge, Event, Node, NodeVersion, Run
+from livegraph.db.models import ContextItem, Edge, Event, Node, NodeVersion, Run
 from livegraph.engine import engine
 from livegraph.engine.serialize import claims_for_run, edge_out, node_out, run_out, version_out
 from livegraph.events import bus
-from livegraph.protocol import CreateRunBody, EventEnvelope, RunSnapshot, RunSummary
+from livegraph.protocol import ContextItemOut, CreateRunBody, EventEnvelope, RunSnapshot, RunSummary, TraceStep
+from livegraph.trace import TOOL_EVENTS, TraceBuilder
 
 router = APIRouter(tags=["runs"])
+
+
+async def running_activity(s, run_id: UUID, node_ids: list[UUID], last_seq: int) -> tuple[dict, dict]:
+    """Tool steps + attempt id of the current attempt of each running node, folded from persisted events.
+
+    Only events with seq <= last_seq are used, so the result is consistent with the snapshot's cut."""
+    if not node_ids:
+        return {}, {}
+    rows = (
+        await s.execute(
+            select(Event)
+            .where(
+                Event.run_id == run_id, Event.node_id.in_(node_ids), Event.seq <= last_seq,
+                Event.type.in_(("node.status", *TOOL_EVENTS)),
+            )
+            .order_by(Event.seq)
+        )
+    ).scalars()
+    builders: dict[UUID, TraceBuilder] = {}
+    attempts: dict[UUID, str] = {}
+    for ev in rows:
+        if ev.type == "node.status":
+            if ev.payload.get("status") == "running":
+                builders[ev.node_id] = TraceBuilder()
+                if ev.payload.get("attempt_id"):
+                    attempts[ev.node_id] = ev.payload["attempt_id"]
+            continue
+        b = builders.get(ev.node_id)
+        if b is not None and ev.payload.get("attempt_id") == attempts.get(ev.node_id):
+            b.apply(ev.type, ev.payload, ev.ts.isoformat())
+    activity = {str(nid): [TraceStep.model_validate(x) for x in b.dump()] for nid, b in builders.items()}
+    return activity, {str(nid): a for nid, a in attempts.items()}
 
 
 async def build_snapshot(run_id: UUID) -> RunSnapshot:
@@ -35,6 +68,9 @@ async def build_snapshot(run_id: UUID) -> RunSnapshot:
                     v = await s.get(NodeVersion, n.current_version_id)
                     if v is not None:
                         versions[str(n.id)] = await version_out(s, v)
+            activity, attempts = await running_activity(
+                s, run_id, [n.id for n in nodes if n.status == "running"], last_seq
+            )
             return RunSnapshot(
                 run=run_out(run),
                 nodes=[node_out(n) for n in nodes],
@@ -43,6 +79,8 @@ async def build_snapshot(run_id: UUID) -> RunSnapshot:
                 claims=await claims_for_run(s, run_id),
                 documents=await rag.list_documents(s, run_id),
                 last_seq=last_seq,
+                activity=activity,
+                attempts=attempts,
             )
 
 
@@ -97,3 +135,14 @@ async def cancel(run_id: UUID) -> RunSummary:
     await _summary(run_id)
     await engine.cancel(run_id)
     return await _summary(run_id)
+
+
+@router.get("/runs/{run_id}/context/{ref}", response_model=ContextItemOut)
+async def get_context_item(run_id: UUID, ref: str) -> ContextItemOut:
+    """A stored tool result by ref (the full text a trace step's ``ref`` points at). Inspector use only:
+    agents read through the scoped context tools."""
+    async with db_base.SessionLocal() as s:
+        row = await s.get(ContextItem, (run_id, ref))
+        if row is None:
+            raise HTTPException(404, "context item not found")
+        return ContextItemOut.model_validate(row)

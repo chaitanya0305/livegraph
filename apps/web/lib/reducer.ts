@@ -7,6 +7,9 @@
  * - Never mutates its inputs; returns a new object when anything changes.
  * - Persisted events with seq <= state.lastSeq are ignored (idempotent replay/resume).
  * - Ephemeral events (seq === null, i.e. node.delta) only touch the live text buffer.
+ * - Tool events (tool.call / tool.result / agent.message) are persisted, so the scrubber
+ *   shows an agent mid-tool. They only apply to a running node whose current attempt
+ *   matches their `attempt_id`; events from a superseded attempt are dropped.
  */
 import type {
   Claim,
@@ -21,13 +24,92 @@ import type {
   Run,
   RunSnapshot,
   RunStatus,
+  SteerSource,
+  ToolChunk,
+  TraceStep,
   UUID,
 } from "./protocol";
+
+/** A tool step as tracked live; extends the persisted TraceStep with in-flight details. */
+export interface ActivityStep extends TraceStep {
+  step?: number;
+  budget?: number | null;
+  error?: string | null;
+  args?: Record<string, unknown>;
+  chunks?: ToolChunk[];
+}
+
+export type StepStatus = "running" | "ok" | "error";
+
+export function stepStatus(step: TraceStep): StepStatus {
+  if (step.ok === null || step.ok === undefined) return "running";
+  return step.ok ? "ok" : "error";
+}
 
 export interface SteerEntry {
   steer_id: UUID;
   text: string;
   consumed: boolean;
+  /** "user", or "agent:<node_key>" when a downstream agent asked for this (request_upstream_work). */
+  source: SteerSource;
+}
+
+/** The agent key behind a steer, or null when it came from the user. */
+export function steerAgent(source: SteerSource | string | null | undefined): string | null {
+  return typeof source === "string" && source.startsWith("agent:") ? source.slice(6) || null : null;
+}
+
+/** "from you" / "from judge" */
+export function steerFromLabel(source: SteerSource | string | null | undefined): string {
+  const agent = steerAgent(source);
+  return agent ? `from ${agent}` : "from you";
+}
+
+const AGENT_STEER_RE = /^Request from ([^:]+):\s*/;
+
+/** Split an agent-originated steer text ("Request from judge: …") into its agent and instruction. */
+export function splitSteerText(text: string): { agent: string | null; text: string } {
+  const m = AGENT_STEER_RE.exec(text);
+  return m ? { agent: m[1]!.trim(), text: text.slice(m[0].length) } : { agent: null, text };
+}
+
+export interface UpstreamRequest {
+  target: string | null;
+  instruction: string;
+  state: "pending" | "accepted" | "rejected";
+  /** rejection reason (tool summary/error) */
+  reason: string | null;
+}
+
+/**
+ * Details of a request_upstream_work step. Live steps carry `args`; persisted traces only have
+ * `args_summary` ("target_node_key=research-1, instruction=…") and the summary ("→ research-1: …").
+ */
+export function upstreamRequest(step: ActivityStep): UpstreamRequest | null {
+  if (step.tool !== "request_upstream_work") return null;
+  let target = typeof step.args?.target_node_key === "string" ? step.args.target_node_key : null;
+  let instruction = typeof step.args?.instruction === "string" ? step.args.instruction : "";
+  if (!target || !instruction) {
+    const m = /^target_node_key=(.*?), instruction=([\s\S]*)$/.exec(step.args_summary ?? "");
+    if (m) {
+      target ||= m[1]!.trim();
+      instruction ||= m[2]!.trim();
+    }
+  }
+  if (step.ok && step.summary) {
+    const m = /^→\s*([^:]+):\s*([\s\S]*)$/.exec(step.summary);
+    if (m) {
+      target ||= m[1]!.trim();
+      instruction ||= m[2]!.trim();
+    }
+  }
+  const state = step.ok === null || step.ok === undefined ? "pending" : step.ok ? "accepted" : "rejected";
+  return {
+    target,
+    instruction: instruction || step.args_summary || "",
+    state,
+    reason: state === "rejected" ? step.error || step.summary || null : null,
+  };
 }
 
 export interface RunErrorEntry {
@@ -58,6 +140,14 @@ export interface RunState {
   prompts: Record<UUID, string>;
   /** reason attached to the latest node.status event */
   statusReason: Record<UUID, string | null>;
+  /** whether the node's latest node.version was a reuse (input-hash hit / early cutoff, no LLM call) */
+  reused: Record<UUID, boolean>;
+  /** tool steps of the node's latest attempt; reset when it enters running, kept after it finishes */
+  activity: Record<UUID, ActivityStep[]>;
+  /** current attempt id per node (set when it enters running) */
+  attempts: Record<UUID, string>;
+  /** chunks returned by tools during the current attempt; cleared when a node.version lands */
+  provisional: Record<UUID, RankedChunk[]>;
   errors: RunErrorEntry[];
   lastSeq: number;
   /** ts of the most recent applied event (persisted or not) */
@@ -87,6 +177,10 @@ export function emptyState(base: BaseContext = {}): RunState {
     steers: {},
     prompts: {},
     statusReason: {},
+    reused: {},
+    activity: {},
+    attempts: {},
+    provisional: {},
     errors: [],
     lastSeq: 0,
     lastTs: null,
@@ -110,6 +204,17 @@ export function stateFromSnapshot(snap: RunSnapshot): RunState {
     s.claims[c.id] = c;
     s.claimOrder.push(c.id);
   }
+  for (const [nodeId, steps] of Object.entries(snap.activity ?? {})) {
+    s.activity[nodeId] = steps.map((st) => ({
+      ...st,
+      exchange: st.exchange ?? [],
+      chunk_ids: st.chunk_ids ?? [],
+      node_ids: st.node_ids ?? [],
+      ref: st.ref ?? null,
+      reads: st.reads ?? [],
+    }));
+  }
+  for (const [nodeId, attempt] of Object.entries(snap.attempts ?? {})) s.attempts[nodeId] = attempt;
   s.lastSeq = snap.last_seq;
   return s;
 }
@@ -125,6 +230,51 @@ function setNode(state: RunState, id: UUID, patch: Partial<Node>): RunState {
   const node = state.nodes[id];
   if (!node) return state;
   return { ...state, nodes: { ...state.nodes, [id]: { ...node, ...patch } } };
+}
+
+/** Is this tool event addressed to the node's current, running attempt? */
+function acceptsTool(state: RunState, id: UUID | null, attemptId: string | undefined | null): id is UUID {
+  if (!id || state.nodes[id]?.status !== "running") return false;
+  const current = state.attempts[id];
+  return !current || !attemptId || current === attemptId;
+}
+
+function updateStep(
+  state: RunState,
+  id: UUID,
+  callId: string,
+  fn: (step: ActivityStep) => ActivityStep,
+): RunState {
+  const list = state.activity[id];
+  const idx = list?.findIndex((x) => x.call_id === callId) ?? -1;
+  if (!list || idx < 0) return state;
+  const next = list.slice();
+  next[idx] = fn(list[idx]!);
+  return { ...state, activity: { ...state.activity, [id]: next } };
+}
+
+function mergeProvisional(
+  existing: RankedChunk[] | undefined,
+  chunks: readonly ToolChunk[],
+  documents: Record<UUID, Document>,
+): RankedChunk[] {
+  const out = existing ? existing.slice() : [];
+  const seen = new Set(out.map((c) => c.chunk_id));
+  for (const c of chunks) {
+    if (seen.has(c.chunk_id)) continue;
+    seen.add(c.chunk_id);
+    out.push({
+      chunk_id: c.chunk_id,
+      document_id: c.document_id,
+      document_title: c.title,
+      source_url: documents[c.document_id]?.source_url ?? null,
+      text: c.snippet,
+      score: c.score,
+      trust: c.trust,
+      rank: out.length + 1,
+    });
+  }
+  return out;
 }
 
 function withoutKey<T>(rec: Record<string, T>, key: string): Record<string, T> {
@@ -178,10 +328,21 @@ function applyPayload(state: RunState, event: EventEnvelope): RunState {
       if (!id || !state.nodes[id]) return state;
       const prev = state.nodes[id].status;
       const next: NodeStatus = event.payload.status;
+      const attemptId = event.payload.attempt_id ?? null;
       let s = setNode(state, id, { status: next });
       s = { ...s, statusReason: { ...s.statusReason, [id]: event.payload.reason ?? null } };
-      // A fresh run starts with an empty buffer (steer restarts, recomputes).
-      if (next === "running" && prev !== "running") s = { ...s, live: withoutKey(s.live, id) };
+      // A fresh attempt starts with an empty buffer and activity (steer restarts, recomputes).
+      const freshAttempt =
+        next === "running" && (prev !== "running" || (attemptId !== null && attemptId !== state.attempts[id]));
+      if (freshAttempt) {
+        s = {
+          ...s,
+          live: withoutKey(s.live, id),
+          activity: { ...s.activity, [id]: [] },
+          provisional: withoutKey(s.provisional, id),
+          attempts: attemptId ? { ...s.attempts, [id]: attemptId } : withoutKey(s.attempts, id),
+        };
+      }
       return s;
     }
 
@@ -189,7 +350,70 @@ function applyPayload(state: RunState, event: EventEnvelope): RunState {
       const id = event.node_id;
       // Only running nodes stream; late deltas (after node.version / cancel) are dropped.
       if (!id || state.nodes[id]?.status !== "running") return state;
-      return { ...state, live: { ...state.live, [id]: (state.live[id] ?? "") + event.payload.text } };
+      const text = event.payload.reset ? event.payload.text : (state.live[id] ?? "") + event.payload.text;
+      return { ...state, live: { ...state.live, [id]: text } };
+    }
+
+    case "tool.call": {
+      const p = event.payload;
+      const id = event.node_id;
+      if (!acceptsTool(state, id, p.attempt_id)) return state;
+      const step: ActivityStep = {
+        call_id: p.call_id,
+        tool: p.tool,
+        agent: p.agent ?? null,
+        parent_call_id: p.parent_call_id ?? null,
+        args_summary: p.args_summary,
+        ok: null,
+        summary: "",
+        chunk_ids: [],
+        node_ids: [],
+        ms: null,
+        ts: event.ts,
+        exchange: [],
+        ref: null,
+        reads: [],
+        step: p.step,
+        budget: p.budget,
+        args: p.args,
+      };
+      const list = (state.activity[id] ?? []).filter((x) => x.call_id !== p.call_id);
+      list.push(step);
+      return { ...state, activity: { ...state.activity, [id]: list } };
+    }
+
+    case "tool.result": {
+      const p = event.payload;
+      const id = event.node_id;
+      if (!acceptsTool(state, id, p.attempt_id)) return state;
+      const chunks = p.chunks ?? [];
+      const s = updateStep(state, id, p.call_id, (st) => ({
+        ...st,
+        ok: p.ok,
+        summary: p.summary,
+        error: p.error,
+        ms: p.ms,
+        chunks,
+        chunk_ids: chunks.map((c) => c.chunk_id),
+        node_ids: p.node_ids ?? [],
+        ref: p.ref ?? null,
+        reads: p.reads ?? [],
+      }));
+      if (s === state || !chunks.length) return s;
+      return { ...s, provisional: { ...s.provisional, [id]: mergeProvisional(s.provisional[id], chunks, s.documents) } };
+    }
+
+    case "agent.message": {
+      const p = event.payload;
+      const id = event.node_id;
+      if (!acceptsTool(state, id, p.attempt_id)) return state;
+      return updateStep(state, id, p.call_id, (st) => ({
+        ...st,
+        exchange: [
+          ...st.exchange,
+          { from_agent: p.from_agent, to_agent: p.to_agent, kind: p.kind, text: p.text, chunk_ids: p.chunk_ids ?? [] },
+        ],
+      }));
     }
 
     case "node.version": {
@@ -199,6 +423,9 @@ function applyPayload(state: RunState, event: EventEnvelope): RunState {
         ...state,
         versions: { ...state.versions, [id]: upsertVersion(state.versions[id], v) },
         live: withoutKey(state.live, id),
+        reused: { ...state.reused, [id]: !!event.payload.reused },
+        // activity is kept (it explains the version); tool chunks now live in retrievals
+        provisional: withoutKey(state.provisional, id),
       };
       if (v.retrievals) s = { ...s, retrievals: { ...s.retrievals, [v.id]: v.retrievals } };
       return setNode(s, id, { current_version_id: v.id });
@@ -214,6 +441,14 @@ function applyPayload(state: RunState, event: EventEnvelope): RunState {
       const id = event.node_id;
       if (!id) return state;
       return setNode(state, id, { removed: true });
+    }
+
+    case "node.updated": {
+      // PATCH /nodes/{id}: title/config changed (status changes arrive as node.status events)
+      const id = event.node_id ?? event.payload.node.id;
+      if (!id || !state.nodes[id]) return state;
+      const { title, config, position } = event.payload.node;
+      return setNode(state, id, { title, config: config ?? {}, ...(position !== undefined ? { position } : {}) });
     }
 
     case "retrieval.done":
@@ -255,7 +490,12 @@ function applyPayload(state: RunState, event: EventEnvelope): RunState {
       const id = event.node_id;
       if (!id) return state;
       const list = (state.steers[id] ?? []).filter((x) => x.steer_id !== event.payload.steer_id);
-      list.push({ steer_id: event.payload.steer_id, text: event.payload.text, consumed: false });
+      list.push({
+        steer_id: event.payload.steer_id,
+        text: event.payload.text,
+        consumed: false,
+        source: event.payload.source ?? "user",
+      });
       return { ...state, steers: { ...state.steers, [id]: list } };
     }
 
@@ -266,7 +506,15 @@ function applyPayload(state: RunState, event: EventEnvelope): RunState {
       const found = list.some((x) => x.steer_id === event.payload.steer_id);
       const next = found
         ? list.map((x) => (x.steer_id === event.payload.steer_id ? { ...x, consumed: true } : x))
-        : [...list, { steer_id: event.payload.steer_id, text: event.payload.text, consumed: true }];
+        : [
+            ...list,
+            {
+              steer_id: event.payload.steer_id,
+              text: event.payload.text,
+              consumed: true,
+              source: event.payload.source ?? "user",
+            },
+          ];
       return { ...state, steers: { ...state.steers, [id]: next } };
     }
 
@@ -337,8 +585,27 @@ export function currentVersion(state: RunState, nodeId: UUID): NodeVersion | nul
   return state.versions[nodeId]?.find((v) => v.id === node.current_version_id) ?? null;
 }
 
+const NO_STEPS: readonly ActivityStep[] = Object.freeze([]);
+
+/**
+ * The tool steps to show for a node: the live attempt while running (or after it failed),
+ * otherwise the current version's persisted trace, falling back to the last live activity.
+ * Returns stable references (safe as a store selector).
+ */
+export function traceFor(state: RunState, nodeId: UUID): readonly ActivityStep[] {
+  const status = state.nodes[nodeId]?.status;
+  const activity = state.activity[nodeId];
+  if (status === "running" || status === "failed") return activity ?? NO_STEPS;
+  return currentVersion(state, nodeId)?.trace ?? activity ?? NO_STEPS;
+}
+
 export function effectiveStatus(node: Node): NodeStatus {
   return node.removed ? "skipped" : node.status;
+}
+
+export function nodeIdByKey(state: RunState, key: string): UUID | null {
+  for (const id of state.nodeOrder) if (state.nodes[id]?.key === key) return id;
+  return null;
 }
 
 export function parentsOf(state: RunState, nodeId: UUID): UUID[] {

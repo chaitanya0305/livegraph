@@ -7,6 +7,7 @@ from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Float,
     ForeignKey,
@@ -14,9 +15,11 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -26,6 +29,13 @@ from livegraph.db.base import Base
 
 class Document(Base):
     __tablename__ = "documents"
+    __table_args__ = (
+        # one document per (run, url): concurrent web ingests of the same page cannot duplicate it
+        Index(
+            "uq_documents_run_source_url", "run_id", "source_url", unique=True,
+            postgresql_where=text("source_url IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
@@ -88,3 +98,24 @@ class Retrieval(Base):
     )
     score: Mapped[float] = mapped_column(Float, nullable=False)
     rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    # cited by the node's output (cited rows rank first); how the agent got it: seed|search|read|web
+    cited: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    via: Mapped[str | None] = mapped_column(String(8), nullable=True)
+
+
+class WebCache(Base):
+    """Per-run web search results by normalized query, so recomputes never re-hit the web (Rerun bypasses)."""
+
+    __tablename__ = "web_cache"
+    __table_args__ = (UniqueConstraint("run_id", "query_norm", name="uq_web_cache_run_query"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False, index=True)
+    query_norm: Mapped[str] = mapped_column(Text, nullable=False)
+    doc_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

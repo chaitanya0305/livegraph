@@ -5,9 +5,18 @@ from __future__ import annotations
 import re
 
 from pydantic import BaseModel, Field
-from pydantic_ai import Agent
 
-from livegraph.agents.base import AgentContext, cite, format_evidence, format_instructions, format_steer
+from livegraph.agents import validators
+from livegraph.agents.base import (
+    AgentContext,
+    AgentFactory,
+    AgentLimits,
+    cite,
+    format_evidence,
+    format_instructions,
+    format_steer,
+)
+from livegraph.agents.tools import context_tools
 
 TYPE = "claims"
 TIER = "fast"
@@ -30,7 +39,13 @@ the user's goal. Number them C1, C2, ... (keys). Each claim must be supported by
 `chunk_id`s (verbatim UUIDs from the evidence list) in `support_chunk_ids`. Do not invent chunk ids.
 Prefer 4-8 claims. Merge duplicates; drop findings with no support."""
 
-agent: Agent[None, ClaimsOutput] = Agent(output_type=ClaimsOutput, instructions=SYSTEM, retries=2, name="claims")
+LIMITS = AgentLimits(request_limit=3, timeout=180)
+
+# context tools only run with CONTEXT_TOOLS_SINGLE_SHOT=true (otherwise this stays a validated single shot)
+agents = AgentFactory(
+    "claims", ClaimsOutput, SYSTEM, tools=context_tools.TOOLS, validator=validators.claims
+)
+agent = agents.get()
 
 
 def build_prompt(ctx: AgentContext) -> str:

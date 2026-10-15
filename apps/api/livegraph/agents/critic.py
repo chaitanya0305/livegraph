@@ -1,13 +1,13 @@
-"""Critic: checks a research node's output; if thin, proposes a follow-up question (graph grows)."""
+"""Critic agent: checks a research node's output; if thin it calls request_follow_up_research (graph grows)."""
 
 from __future__ import annotations
 
 from typing import Literal
 
 from pydantic import BaseModel, Field
-from pydantic_ai import Agent
 
-from livegraph.agents.base import AgentContext, format_instructions, format_steer
+from livegraph.agents.base import AgentContext, AgentFactory, AgentLimits, format_instructions, format_steer
+from livegraph.agents.tools import context_tools, graph_tools
 
 TYPE = "critic"
 TIER = "fast"
@@ -27,7 +27,18 @@ SYSTEM = """You are a demanding research critic. Judge whether the research resu
 question with cited evidence. Answer `thin` only if there are clear gaps, few/no citations, or the findings
 do not address the question; then give exactly one focused `follow_up_question`. Otherwise answer `ok`."""
 
-agent: Agent[None, CriticOutput] = Agent(output_type=CriticOutput, instructions=SYSTEM, retries=2, name="critic")
+TOOL_SYSTEM = """
+
+When the verdict is `thin`, FIRST call `request_follow_up_research(question)` exactly once with your
+follow-up question (it adds a research node to the graph that runs before the claims are drafted), then
+return your verdict with the same `follow_up_question`. Never call it for `ok` research."""
+
+LIMITS = AgentLimits(request_limit=4, timeout=90, budgets={"request_follow_up_research": 1})
+
+agents = AgentFactory(
+    "critic", CriticOutput, SYSTEM, tool_system=TOOL_SYSTEM, tools=[graph_tools.FOLLOW_UP, *context_tools.TOOLS]
+)
+agent = agents.get()
 
 
 def build_prompt(ctx: AgentContext) -> str:

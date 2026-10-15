@@ -6,6 +6,8 @@ from typing import Any
 
 import httpx
 
+from livegraph.trace import TOOL_EVENTS, TraceBuilder
+
 DOCS = {
     "solar.txt": "Solar capacity growth was rapid. Global solar capacity growth doubled as panel prices fell. "
     "Solar installations grew in China, Europe and the US.",
@@ -71,11 +73,41 @@ async def events(client: httpx.AsyncClient, run_id: str, since: int = 0) -> list
     return (await client.get(f"/api/runs/{run_id}/events", params={"since": since})).json()
 
 
+TRACE_KEYS = ("call_id", "tool", "agent", "parent_call_id", "ok", "chunk_ids", "node_ids", "summary", "ref", "reads")
+
+
+def trace_sig(steps: list[dict]) -> list[tuple]:
+    return [tuple(tuple(x[k]) if isinstance(x[k], list) else x[k] for k in TRACE_KEYS) for x in steps]
+
+
 def fold(evs: list[dict]) -> dict[str, Any]:
-    """Rebuild state from persisted events only (what the frontend scrubber does)."""
-    st: dict[str, Any] = {"run_status": None, "nodes": {}, "edges": {}, "versions": {}, "claims": {}}
+    """Rebuild state from persisted events only (what the frontend scrubber does).
+
+    Also folds tool activity: ``activity[node_id]`` = steps of the node's current attempt (tool events of a
+    stale attempt_id are ignored), and ``traces[version_id]`` = the steps of the attempt that produced it."""
+    st: dict[str, Any] = {
+        "run_status": None, "nodes": {}, "edges": {}, "versions": {}, "claims": {},
+        "attempts": {}, "activity": {}, "traces": {}, "stale_tool_events": 0,
+    }
+    builders: dict[str, TraceBuilder | None] = {}
     for e in evs:
         t, p, nid = e["type"], e["payload"], e["node_id"]
+        if t in TOOL_EVENTS:
+            b = builders.get(nid)
+            if b is None or p["attempt_id"] != st["attempts"].get(nid):
+                st["stale_tool_events"] += 1
+                continue
+            b.apply(t, p, e["ts"])
+            st["activity"][nid] = b.dump()
+            continue
+        if t == "node.status" and p["status"] == "running":
+            st["attempts"][nid] = p.get("attempt_id")
+            builders[nid] = TraceBuilder()
+            st["activity"][nid] = []
+        if t == "node.version":
+            b = builders.pop(nid, None)
+            if not p["reused"]:
+                st["traces"][p["version"]["id"]] = b.dump() if b is not None else []
         if t == "run.status":
             st["run_status"] = p["status"]
         elif t == "node.added":
@@ -111,6 +143,12 @@ def assert_fold_matches(snap: dict, evs: list[dict]) -> None:
         assert f["current_version_id"] == n["current_version_id"], n["key"]
         assert f["removed"] == n["removed"], n["key"]
     assert set(st["edges"]) == {e["id"] for e in snap["edges"]}
+    assert st["stale_tool_events"] == 0, "tool events of a superseded attempt were persisted"
+    for nid, v in snap["versions"].items():
+        if v["id"] in st["traces"]:
+            assert trace_sig(v["trace"]) == trace_sig(st["traces"][v["id"]]), nid
+    for nid, steps in snap.get("activity", {}).items():
+        assert trace_sig(steps) == trace_sig(st["activity"].get(nid, [])), nid
     for c in snap["claims"]:
         f = st["claims"][c["id"]]
         assert f["status"] == c["status"], c["key"]

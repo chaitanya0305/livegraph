@@ -6,6 +6,8 @@ WORKDIR /app
 COPY pyproject.toml uv.lock .python-version ./
 RUN uv sync --frozen --no-dev --no-install-project
 COPY livegraph ./livegraph
+COPY alembic.ini ./
+COPY migrations ./migrations
 RUN uv sync --frozen --no-dev
 ENV PATH="/app/.venv/bin:$PATH"
 EXPOSE 8000

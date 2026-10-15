@@ -2,18 +2,21 @@
 
 import { Ban, CornerDownLeft, Pencil, RotateCw, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { currentVersion, effectiveStatus } from "@/lib/reducer";
+import { currentVersion, effectiveStatus, splitSteerText, steerAgent, traceFor } from "@/lib/reducer";
 import { useReadOnly, useRunStore, useView } from "@/lib/store";
 import { useCitations } from "@/lib/useCitations";
 import type { Node } from "@/lib/protocol";
 import { NODE_STATUS_LABEL, nodeTypeMeta } from "../meta";
 import { Button, Kbd, Markdown, SectionLabel, StatusPill, cx } from "../ui";
+import { ActivityTab, TOOL_NODE_TYPES } from "./ActivityTab";
+import { ConfigCard } from "./ConfigCard";
+import { ImpactConfirm } from "./ImpactConfirm";
 import { RunOverview } from "./RunOverview";
 import { SourcesTab } from "./SourcesTab";
 import { useAction } from "./useAction";
 import { VersionsTab } from "./VersionsTab";
 
-type Tab = "output" | "versions" | "sources";
+type Tab = "output" | "activity" | "versions" | "sources";
 
 export function Inspector() {
   const selectedId = useRunStore((s) => s.selectedNodeId);
@@ -29,17 +32,22 @@ function NodeInspector({ node }: { node: Node }) {
   const versionsCount = useView((s) => s.versions[node.id]?.length ?? 0);
   const version = useView((s) => currentVersion(s, node.id));
   const sourcesCount = useView((s) => (version ? s.retrievals[version.id]?.length ?? 0 : 0));
+  const provisionalCount = useView((s) => s.provisional[node.id]?.length ?? 0);
+  const toolCount = useView((s) => traceFor(s, node.id).length);
   const status = effectiveStatus(node);
   const meta = nodeTypeMeta(node.type);
   const Icon = meta.icon;
   const action = useAction();
-  const [confirmVeto, setConfirmVeto] = useState(false);
+  const [confirming, setConfirming] = useState<"rerun" | "veto" | null>(null);
 
   const tabs: { id: Tab; label: string; count?: number }[] = [
     { id: "output", label: node.type === "human_input" ? "Answer" : "Output" },
-    { id: "versions", label: "Versions", count: versionsCount },
   ];
-  if (node.type === "research") tabs.push({ id: "sources", label: "Sources", count: sourcesCount });
+  if (TOOL_NODE_TYPES.has(node.type) || toolCount) tabs.push({ id: "activity", label: "Activity", count: toolCount });
+  tabs.push({ id: "versions", label: "Versions", count: versionsCount });
+  const liveSources = status === "running" && provisionalCount > 0;
+  if (node.type === "research" || sourcesCount || provisionalCount)
+    tabs.push({ id: "sources", label: "Sources", count: liveSources ? provisionalCount : sourcesCount });
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -79,38 +87,43 @@ function NodeInspector({ node }: { node: Node }) {
                   title="Run this step again, even if its inputs haven't changed"
                   loading={action.pending === "rerun"}
                   disabled={status === "running" || status === "pending"}
-                  onClick={() => action.run("rerun", (b) => b.rerun(node.id))}
+                  aria-pressed={confirming === "rerun"}
+                  onClick={() => setConfirming((c) => (c === "rerun" ? null : "rerun"))}
                 >
                   {action.pending !== "rerun" ? <RotateCw className="size-3.5" /> : null}
                   Rerun
                 </Button>
               ) : null}
-              {confirmVeto ? (
-                <span className="flex items-center gap-1">
-                  <Button
-                    size="sm"
-                    variant="danger"
-                    loading={action.pending === "veto"}
-                    onClick={async () => {
-                      await action.run("veto", (b) => b.veto(node.id));
-                      setConfirmVeto(false);
-                    }}
-                  >
-                    Veto step
-                  </Button>
-                  <Button size="sm" variant="ghost" onClick={() => setConfirmVeto(false)}>
-                    Keep
-                  </Button>
-                </span>
-              ) : (
-                <Button size="sm" variant="danger" onClick={() => setConfirmVeto(true)} title="Remove this step">
-                  <Ban className="size-3.5" />
-                  Veto
-                </Button>
-              )}
+              <Button
+                size="sm"
+                variant="danger"
+                aria-pressed={confirming === "veto"}
+                onClick={() => setConfirming((c) => (c === "veto" ? null : "veto"))}
+                title="Remove this step"
+              >
+                <Ban className="size-3.5" />
+                Veto
+              </Button>
             </div>
           ) : null}
         </div>
+        {confirming && !readOnly && !node.removed ? (
+          <ImpactConfirm
+            key={confirming}
+            className="mt-2.5"
+            nodeId={node.id}
+            action={confirming}
+            danger={confirming === "veto"}
+            confirmLabel={confirming === "veto" ? "Veto step" : "Rerun"}
+            pending={action.pending === confirming}
+            onCancel={() => setConfirming(null)}
+            onConfirm={async () => {
+              const which = confirming;
+              const ok = await action.run(which, (b) => (which === "veto" ? b.veto(node.id) : b.rerun(node.id)));
+              if (ok) setConfirming(null);
+            }}
+          />
+        ) : null}
         {action.error ? <p className="mt-2 text-[12px] text-red-ink">{action.error}</p> : null}
       </div>
 
@@ -134,6 +147,7 @@ function NodeInspector({ node }: { node: Node }) {
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         {tab === "output" ? <OutputTab node={node} /> : null}
+        {tab === "activity" ? <ActivityTab node={node} /> : null}
         {tab === "versions" ? <VersionsTab node={node} /> : null}
         {tab === "sources" ? <SourcesTab node={node} /> : null}
       </div>
@@ -152,6 +166,7 @@ function OutputTab({ node }: { node: Node }) {
   const allErrors = useView((s) => s.errors);
   const errors = allErrors.filter((e) => e.node_id === node.id);
   const [editing, setEditing] = useState(false);
+  const [confirmEdit, setConfirmEdit] = useState(false);
   const [draft, setDraft] = useState("");
   const action = useAction();
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -168,9 +183,18 @@ function OutputTab({ node }: { node: Node }) {
 
   const streaming = status === "running";
   const text = streaming ? live ?? "" : version?.output_text ?? "";
+  const saveEdit = async () => {
+    const ok = await action.run("edit", (b) => b.edit(node.id, draft));
+    if (ok) {
+      setConfirmEdit(false);
+      setEditing(false);
+    }
+  };
+  const canSave = !!draft.trim() && draft !== version?.output_text;
 
   return (
     <div ref={scrollRef} className="space-y-4 px-5 py-4">
+      <ConfigCard node={node} />
       {status === "stale" ? (
         <Notice tone="neutral">
           Inputs changed{reason ? ` (${reason})` : ""}. This step will recompute; the output below is the previous version.
@@ -179,11 +203,7 @@ function OutputTab({ node }: { node: Node }) {
       {status === "failed" ? (
         <Notice tone="red">{errors.at(-1)?.message ?? reason ?? "This step failed."}</Notice>
       ) : null}
-      {version?.steer_text && !streaming ? (
-        <p className="text-[12px] text-ink-3">
-          Steered with <span className="text-accent-ink">“{version.steer_text}”</span>
-        </p>
-      ) : null}
+      {version?.steer_text && !streaming ? <SteeredWith text={version.steer_text} /> : null}
 
       {editing ? (
         <div className="space-y-2">
@@ -192,32 +212,34 @@ function OutputTab({ node }: { node: Node }) {
             onChange={(e) => setDraft(e.target.value)}
             className="min-h-[320px] w-full resize-y rounded-lg border border-line-strong bg-surface p-3 font-mono text-[12.5px] leading-relaxed outline-none focus:border-accent"
             autoFocus
-            onKeyDown={async (e) => {
-              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-                const ok = await action.run("edit", (b) => b.edit(node.id, draft));
-                if (ok) setEditing(false);
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && canSave) setConfirmEdit(true);
+              if (e.key === "Escape") {
+                if (confirmEdit) setConfirmEdit(false);
+                else setEditing(false);
               }
-              if (e.key === "Escape") setEditing(false);
             }}
           />
-          <div className="flex items-center gap-2">
-            <Button
-              variant="primary"
-              size="sm"
-              loading={action.pending === "edit"}
-              disabled={!draft.trim() || draft === version?.output_text}
-              onClick={async () => {
-                const ok = await action.run("edit", (b) => b.edit(node.id, draft));
-                if (ok) setEditing(false);
-              }}
-            >
-              Save as new version
-            </Button>
-            <Button variant="ghost" size="sm" onClick={() => setEditing(false)}>
-              Cancel
-            </Button>
-            <span className="ml-auto text-[11.5px] text-ink-4">Downstream steps will recompute</span>
-          </div>
+          {confirmEdit ? (
+            <ImpactConfirm
+              nodeId={node.id}
+              action="edit"
+              confirmLabel="Save as new version"
+              pending={action.pending === "edit"}
+              onCancel={() => setConfirmEdit(false)}
+              onConfirm={() => void saveEdit()}
+            />
+          ) : (
+            <div className="flex items-center gap-2">
+              <Button variant="primary" size="sm" disabled={!canSave} onClick={() => setConfirmEdit(true)}>
+                Save as new version
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => setEditing(false)}>
+                Cancel
+              </Button>
+              <span className="ml-auto text-[11.5px] text-ink-4">Downstream steps will recompute</span>
+            </div>
+          )}
           {action.error ? <p className="text-[12px] text-red-ink">{action.error}</p> : null}
         </div>
       ) : text ? (
@@ -229,6 +251,7 @@ function OutputTab({ node }: { node: Node }) {
               className="float-right ml-3"
               onClick={() => {
                 setDraft(version.output_text);
+                setConfirmEdit(false);
                 setEditing(true);
               }}
             >
@@ -286,32 +309,73 @@ function QueuedSteers({ node }: { node: Node }) {
     <div className="space-y-2 border-t border-line pt-3">
       <SectionLabel>Steering</SectionLabel>
       <ul className="space-y-1.5">
-        {steers.map((s) => (
-          <li key={s.steer_id} className="flex items-start gap-2 text-[12.5px]">
-            <span
-              className={cx(
-                "mt-1.5 size-1.5 shrink-0 rounded-full",
-                s.consumed ? "bg-ink-4" : "bg-accent",
-              )}
-            />
-            <span className={s.consumed ? "text-ink-3" : "text-ink"}>{s.text}</span>
-            <span className="ml-auto shrink-0 text-[11px] text-ink-4">{s.consumed ? "applied" : "queued"}</span>
-          </li>
-        ))}
+        {steers.map((s) => {
+          const agent = steerAgent(s.source);
+          const text = agent ? splitSteerText(s.text).text : s.text;
+          return (
+            <li key={s.steer_id} className="flex items-start gap-2 text-[12.5px]">
+              <span
+                className={cx(
+                  "mt-1.5 size-1.5 shrink-0 rounded-full",
+                  s.consumed ? "bg-ink-4" : agent ? "bg-violet" : "bg-accent",
+                )}
+              />
+              <span className="min-w-0">
+                <SteerSourceTag agent={agent} />{" "}
+                <span className={s.consumed ? "text-ink-3" : "text-ink"}>{text}</span>
+              </span>
+              <span className="ml-auto shrink-0 text-[11px] text-ink-4">{s.consumed ? "applied" : "queued"}</span>
+            </li>
+          );
+        })}
       </ul>
+    </div>
+  );
+}
+
+/** "from you" / "from judge" chip for a steer. */
+export function SteerSourceTag({ agent }: { agent: string | null }) {
+  return agent ? (
+    <span className="rounded bg-violet-soft px-1 text-[10.5px] font-medium whitespace-nowrap text-violet">from {agent}</span>
+  ) : (
+    <span className="rounded bg-accent-soft px-1 text-[10.5px] font-medium whitespace-nowrap text-accent-ink">from you</span>
+  );
+}
+
+function SteeredWith({ text }: { text: string }) {
+  // A version's steer_text joins every steer it consumed; agent requests read "Request from <key>: …".
+  const parts = text.split("\n").filter((t) => t.trim());
+  return (
+    <div className="space-y-0.5 text-[12px] text-ink-3">
+      {parts.map((p, i) => {
+        const { agent, text: body } = splitSteerText(p);
+        return (
+          <p key={i}>
+            {agent ? `Asked by ${agent}: ` : "Steered by you with "}
+            <span className={agent ? "text-violet" : "text-accent-ink"}>“{body}”</span>
+          </p>
+        );
+      })}
     </div>
   );
 }
 
 function SteerBox({ node }: { node: Node }) {
   const [text, setText] = useState("");
+  const [confirming, setConfirming] = useState(false);
   const action = useAction();
   const status = effectiveStatus(node);
-  const submit = async () => {
+  const submit = () => {
+    if (text.trim()) setConfirming(true);
+  };
+  const send = async () => {
     const t = text.trim();
     if (!t) return;
     const res = await action.run("steer", (b) => b.steer(node.id, t));
-    if (res) setText("");
+    if (res) {
+      setText("");
+      setConfirming(false);
+    }
   };
   const hint =
     status === "running"
@@ -324,9 +388,20 @@ function SteerBox({ node }: { node: Node }) {
       className="border-t border-line bg-surface px-4 py-3"
       onSubmit={(e) => {
         e.preventDefault();
-        void submit();
+        submit();
       }}
     >
+      {confirming && text.trim() ? (
+        <ImpactConfirm
+          className="mb-2"
+          nodeId={node.id}
+          action="steer"
+          confirmLabel="Send steer"
+          pending={action.pending === "steer"}
+          onCancel={() => setConfirming(false)}
+          onConfirm={() => void send()}
+        />
+      ) : null}
       <label htmlFor="steer" className="sr-only">
         Steer this step
       </label>
@@ -335,17 +410,20 @@ function SteerBox({ node }: { node: Node }) {
           id="steer"
           value={text}
           rows={1}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => {
+            setText(e.target.value);
+            if (confirming) setConfirming(false);
+          }}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
-              void submit();
+              submit();
             }
           }}
           placeholder={`Steer ${node.title.toLowerCase()}…`}
           className="max-h-32 min-h-[22px] flex-1 resize-none bg-transparent focus-visible:outline-none text-[13px] leading-[22px] outline-none placeholder:text-ink-4"
         />
-        <Button type="submit" size="sm" variant="primary" loading={action.pending === "steer"} disabled={!text.trim()}>
+        <Button type="submit" size="sm" variant="primary" loading={action.pending === "steer"} disabled={!text.trim() || confirming}>
           Steer
           {action.pending !== "steer" ? <CornerDownLeft className="size-3" /> : null}
         </Button>

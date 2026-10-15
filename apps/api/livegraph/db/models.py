@@ -12,6 +12,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     PrimaryKeyConstraint,
     String,
@@ -20,6 +21,7 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy import text as sa_text  # `text` is also a ContextItem column name
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -99,6 +101,10 @@ class NodeVersion(Base):
     )
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     input_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # sha256 of the output content (output + normalized text + (chunk_id, cited) retrievals): downstream input
+    # hashes use it instead of the version id, so a recompute with an identical result stops propagating.
+    # NULL for versions written before migration 0003 (the version id is used instead).
+    output_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     output: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     output_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
     # initial|steer|edit|recompute|retry|restore
@@ -107,6 +113,10 @@ class NodeVersion(Base):
     model: Mapped[str | None] = mapped_column(String(128), nullable=True)
     tokens_in: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tokens_out: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # tool steps of the attempt that produced this version (TraceStep dicts, see livegraph/trace.py)
+    trace: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
     created_at: Mapped[datetime] = _ts()
 
 
@@ -132,6 +142,8 @@ class SteerMessage(Base):
         PGUUID(as_uuid=True), ForeignKey("nodes.id", ondelete="CASCADE"), nullable=False, index=True
     )
     text: Mapped[str] = mapped_column(Text, nullable=False)
+    # "user", or "agent:<node_key>" for a request_upstream_work call of a downstream agent
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="user", server_default="user")
     created_at: Mapped[datetime] = _ts()
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -169,6 +181,52 @@ class ClaimHistory(Base):
     )
     rationale: Mapped[str] = mapped_column(Text, nullable=False, default="")
     ts: Mapped[datetime] = _ts()
+
+
+class ContextItem(Base):
+    """One stored tool result (or judge rebuttal) of an agent attempt, addressable as ``ref`` ("ctx_" + 8 hex).
+
+    Written by ``guard.run_tool`` as the call finishes; ``node_version_id`` is backfilled once the attempt's
+    version persists, so rows of superseded attempts keep NULL and are never readable by other agents.
+    Agents get them back with ``recall(ref)`` / ``search_context`` (agents/tools/context_tools.py).
+    """
+
+    __tablename__ = "context_items"
+    __table_args__ = (
+        PrimaryKeyConstraint("run_id", "ref", name="pk_context_items"),
+        Index("ix_context_items_run_version", "run_id", "node_version_id"),
+        Index("ix_context_items_text_fts", text("to_tsvector('english', text)"), postgresql_using="gin"),
+    )
+
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("runs.id", ondelete="CASCADE", name="fk_context_items_run_id"),
+        nullable=False,
+    )
+    ref: Mapped[str] = mapped_column(String(16), nullable=False)
+    node_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("nodes.id", ondelete="CASCADE", name="fk_context_items_node_id"),
+        nullable=False,
+    )
+    attempt_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    node_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("node_versions.id", ondelete="SET NULL", name="fk_context_items_node_version_id"),
+        nullable=True,
+    )
+    agent: Mapped[str] = mapped_column(String(32), nullable=False)  # "prosecutor" inside the judge's ask_rebuttal
+    parent_ref: Mapped[str | None] = mapped_column(String(16), nullable=True)  # the ask_rebuttal call's ref
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="tool_result")  # tool_result|rebuttal
+    tool: Mapped[str] = mapped_column(String(64), nullable=False)
+    args: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    ok: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    text: Mapped[str] = mapped_column(Text, nullable=False)  # the full result the model saw
+    # deterministic one-line stub (tool(args) -> summary [chunk_id=...]); compaction shows it instead of text
+    summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    chunk_ids: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    tokens_est: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = _ts()
 
 
 # Make sure the RAG tables (documents, chunks, retrievals) are registered on Base.metadata

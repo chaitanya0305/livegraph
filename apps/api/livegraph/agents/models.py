@@ -68,7 +68,7 @@ def uses_prompted_output(model: Model) -> bool:
 
 
 def smart() -> Model:
-    return _overrides.get("smart") or _openrouter(settings.model_smart, settings.provider_smart)
+    return _overrides.get("smart") or _openrouter(settings.model_smart, settings.provider_smart, settings.reasoning_smart)
 
 
 def fast(reasoning: bool | None = None) -> Model:

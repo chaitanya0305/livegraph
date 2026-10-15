@@ -1,11 +1,13 @@
 "use client";
 
 import { Handle, Position, type NodeProps } from "@xyflow/react";
+import { Recycle, Wrench } from "lucide-react";
 import { memo } from "react";
-import { currentVersion, effectiveStatus } from "@/lib/reducer";
+import { impactMark } from "@/lib/impact";
+import { currentVersion, effectiveStatus, stepStatus, traceFor } from "@/lib/reducer";
 import { useRunStore, useView } from "@/lib/store";
 import type { CreatedBy, NodeStatus } from "@/lib/protocol";
-import { NODE_STATUS_LABEL, nodeTypeMeta } from "../meta";
+import { NODE_STATUS_LABEL, nodeTypeMeta, stepLine, toolMeta } from "../meta";
 import { cx } from "../ui";
 import { NODE_H, NODE_W } from "./layout";
 
@@ -46,6 +48,7 @@ function GraphNodeImpl({ data, selected }: NodeProps & { data: GraphNodeData }) 
   const version = useView((s) => currentVersion(s, id));
   const prompt = useView((s) => s.prompts[id]);
   const reason = useView((s) => s.statusReason[id]);
+  const trace = useView((s) => traceFor(s, id));
   const pendingInputs = useView((s) => {
     let n = 0;
     for (const e of Object.values(s.edges)) {
@@ -56,6 +59,8 @@ function GraphNodeImpl({ data, selected }: NodeProps & { data: GraphNodeData }) 
     return n;
   });
   const isNew = useRunStore((s) => s.scrubSeq === null);
+  const reused = useView((s) => !!s.reused[id]);
+  const mark = useRunStore((s) => impactMark(s.impactPreview, id));
 
   if (!node) return null;
   const status = effectiveStatus(node);
@@ -66,11 +71,39 @@ function GraphNodeImpl({ data, selected }: NodeProps & { data: GraphNodeData }) 
   let body: React.ReactNode;
   switch (status) {
     case "running": {
-      const tail = (live ?? "").slice(-220);
-      body = tail ? (
-        <p className="lg-stream-tail lg-caret line-clamp-3 text-[11.5px] leading-[1.45] text-ink-2">{plain(tail)}</p>
-      ) : (
-        <p className="text-[11.5px] text-accent-ink">Thinking…</p>
+      const tail = plain((live ?? "").slice(-220));
+      const latest = trace.at(-1);
+      if (!latest && !tail) {
+        body = <p className="text-[11.5px] text-accent-ink">Thinking…</p>;
+        break;
+      }
+      const StepIcon = latest ? toolMeta(latest.tool).icon : null;
+      const inFlight = latest ? stepStatus(latest) === "running" : false;
+      body = (
+        <div className="space-y-0.5">
+          {latest && StepIcon ? (
+            <p
+              className={cx(
+                "flex items-center gap-1 text-[11px] leading-[1.45]",
+                inFlight ? "text-sky-ink" : "text-ink-3",
+              )}
+              title={stepLine(latest)}
+            >
+              <StepIcon className={cx("size-3 shrink-0", inFlight && "animate-pulse")} strokeWidth={2} />
+              <span className="min-w-0 truncate">{stepLine(latest)}</span>
+            </p>
+          ) : null}
+          {tail ? (
+            <p
+              className={cx(
+                "lg-stream-tail lg-caret text-[11.5px] leading-[1.45] text-ink-2",
+                latest ? "line-clamp-2" : "line-clamp-3",
+              )}
+            >
+              {tail}
+            </p>
+          ) : null}
+        </div>
       );
       break;
     }
@@ -114,11 +147,14 @@ function GraphNodeImpl({ data, selected }: NodeProps & { data: GraphNodeData }) 
     <div
       style={{ width: NODE_W, height: NODE_H }}
       className={cx(
-        "group flex flex-col rounded-[10px] border px-3 pt-2.5 pb-2 transition-[background-color,border-color,opacity] duration-300",
+        "group relative flex flex-col rounded-[10px] border px-3 pt-2.5 pb-2 transition-[background-color,border-color,opacity] duration-300",
         CARD[status],
         isNew && "lg-node-in",
         selected && "outline-2 outline-offset-2 outline-ink",
+        mark === "rerun" && "lg-impact-rerun",
+        mark === "skipped" && "lg-impact-skip",
       )}
+      title={mark === "rerun" ? "Would rerun" : mark === "skipped" ? "Would be skipped" : undefined}
     >
       <Handle type="target" position={Position.Left} isConnectable={false} />
       <div className="flex items-center gap-2">
@@ -148,9 +184,31 @@ function GraphNodeImpl({ data, selected }: NodeProps & { data: GraphNodeData }) 
       </div>
       <div className="mt-2 min-h-0 flex-1 overflow-hidden">{body}</div>
       <div className="mt-1 flex items-center justify-between text-[10.5px]">
-        <span className="flex items-center gap-1.5 text-ink-3">
+        <span className="flex min-w-0 items-center gap-1.5 overflow-hidden text-ink-3">
           {meta.label}
           <span className={creator.cls}>{creator.label}</span>
+          {status === "done" && (reason === "upstream unchanged" || reused) ? (
+            <span
+              className="inline-flex min-w-0 items-center gap-0.5 rounded bg-green-soft px-1 whitespace-nowrap text-green-ink"
+              title={
+                reason === "upstream unchanged"
+                  ? "Its inputs came back unchanged, so the previous result was reused (no model call)"
+                  : "Inputs matched an earlier version, so that result was reused (no model call)"
+              }
+            >
+              <Recycle className="size-2.5" strokeWidth={2.25} />
+              {reason === "upstream unchanged" ? "unchanged · reused" : "reused"}
+            </span>
+          ) : null}
+          {trace.length ? (
+            <span
+              className="inline-flex items-center gap-0.5 rounded bg-sky-soft px-1 font-mono text-sky-ink tabular-nums"
+              title={`${trace.length} tool call${trace.length > 1 ? "s" : ""}`}
+            >
+              <Wrench className="size-2.5" strokeWidth={2.25} />
+              {trace.length}
+            </span>
+          ) : null}
         </span>
         <span
           className={cx(

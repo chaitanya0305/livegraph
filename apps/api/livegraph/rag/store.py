@@ -60,17 +60,22 @@ async def ingest_file(session: AsyncSession, *, run_id: UUID | None, filename: s
     return await ingest_text(session, run_id=run_id, title=filename, text=text, origin="upload")
 
 
-def _scope(run_id: UUID):
-    return [or_(Document.run_id == run_id, Document.run_id.is_(None)), Document.trust != "distrusted"]
+def _scope(run_id: UUID, document_ids: list[UUID] | None = None):
+    conds = [or_(Document.run_id == run_id, Document.run_id.is_(None)), Document.trust != "distrusted"]
+    if document_ids is not None:
+        conds.append(Document.id.in_(document_ids))
+    return conds
 
 
-async def search(session: AsyncSession, *, run_id: UUID, query: str, k: int = 6) -> list[RetrievedChunk]:
+async def search(
+    session: AsyncSession, *, run_id: UUID, query: str, k: int = 6, document_ids: list[UUID] | None = None
+) -> list[RetrievedChunk]:
     """Cosine search over run-scoped + global docs, excluding distrusted ones.
 
     score = 1 - cosine_distance (+0.15 for pinned docs). Each pinned doc's best chunk is
-    guaranteed a slot if its raw score > 0.2.
+    guaranteed a slot if its raw score > 0.2. ``document_ids`` restricts the search to those docs.
     """
-    if k <= 0 or not query.strip():
+    if k <= 0 or not query.strip() or document_ids == []:
         return []
     [qvec] = await get_embedder().embed([query])
     dist = Chunk.embedding.cosine_distance(qvec).label("dist")
@@ -79,7 +84,7 @@ async def search(session: AsyncSession, *, run_id: UUID, query: str, k: int = 6)
     stmt = (
         select(*cols)
         .join(Document, Chunk.document_id == Document.id)
-        .where(*_scope(run_id))
+        .where(*_scope(run_id, document_ids))
         .order_by(dist)
         .limit(max(k * 4, 24))
     )
@@ -92,14 +97,15 @@ async def search(session: AsyncSession, *, run_id: UUID, query: str, k: int = 6)
             text=r.text, score=raw + (PIN_BOOST if r.trust == "pinned" else 0.0), trust=r.trust,
         )
 
-    cands = sorted((to_rc(r) for r in rows), key=lambda c: c.score, reverse=True)
+    # chunk id breaks score ties so equal-scoring chunks always rank the same way (stable input hashes)
+    cands = sorted((to_rc(r) for r in rows), key=lambda c: (-c.score, str(c.chunk_id)))
     results = cands[:k]
 
     # Guarantee each relevant pinned doc's best chunk.
     pinned_stmt = (
         select(*cols)
         .join(Document, Chunk.document_id == Document.id)
-        .where(*_scope(run_id), Document.trust == "pinned")
+        .where(*_scope(run_id, document_ids), Document.trust == "pinned")
         .order_by(Chunk.document_id, dist)
         .ext(distinct_on(Chunk.document_id))
     )
@@ -119,10 +125,21 @@ async def search(session: AsyncSession, *, run_id: UUID, query: str, k: int = 6)
     return results
 
 
-async def record_retrieval(session: AsyncSession, *, node_version_id: UUID, chunks: list[RetrievedChunk]) -> None:
+async def record_retrieval(
+    session: AsyncSession,
+    *,
+    node_version_id: UUID,
+    chunks: list[RetrievedChunk],
+    cited: set[str] | None = None,
+    via: dict[str, str] | None = None,
+) -> None:
     """Persist retrievals for a node version; rank is the 1-based position in ``chunks``."""
+    cited, via = cited or set(), via or {}
     session.add_all(
-        Retrieval(node_version_id=node_version_id, chunk_id=c.chunk_id, score=c.score, rank=i)
+        Retrieval(
+            node_version_id=node_version_id, chunk_id=c.chunk_id, score=c.score, rank=i,
+            cited=str(c.chunk_id) in cited, via=via.get(str(c.chunk_id)),
+        )
         for i, c in enumerate(chunks, start=1)
     )
     await session.flush()
@@ -143,7 +160,28 @@ async def get_retrievals(session: AsyncSession, node_version_id: UUID) -> list[d
             chunk_id=c.id, document_id=d.id, document_title=d.title, source_url=d.source_url,
             text=c.text, score=r.score, trust=d.trust,
         )
-        out.append({**rc.model_dump(mode="json"), "rank": r.rank})
+        out.append({**rc.model_dump(mode="json"), "rank": r.rank, "cited": bool(r.cited), "via": r.via})
+    return out
+
+
+async def get_retrievals_many(session: AsyncSession, node_version_ids: list[UUID]) -> dict[UUID, list[dict]]:
+    """``get_retrievals`` for several versions in one query: {version_id: [dict, ...]} (each ordered by rank)."""
+    out: dict[UUID, list[dict]] = {vid: [] for vid in node_version_ids}
+    if not node_version_ids:
+        return out
+    stmt = (
+        select(Retrieval, Chunk, Document)
+        .join(Chunk, Retrieval.chunk_id == Chunk.id)
+        .join(Document, Chunk.document_id == Document.id)
+        .where(Retrieval.node_version_id.in_(list(node_version_ids)))
+        .order_by(Retrieval.node_version_id, Retrieval.rank)
+    )
+    for r, c, d in (await session.execute(stmt)).all():
+        rc = RetrievedChunk(
+            chunk_id=c.id, document_id=d.id, document_title=d.title, source_url=d.source_url,
+            text=c.text, score=r.score, trust=d.trust,
+        )
+        out[r.node_version_id].append({**rc.model_dump(mode="json"), "rank": r.rank, "cited": bool(r.cited), "via": r.via})
     return out
 
 
@@ -188,3 +226,16 @@ async def list_documents(session: AsyncSession, run_id: UUID | None = None) -> l
     docs = list((await session.execute(select(Document).where(cond).order_by(Document.created_at))).scalars())
     counts = await _chunk_counts(session, [d.id for d in docs])
     return [_to_out(d, counts.get(d.id, 0)) for d in docs]
+
+
+async def corpus_fingerprint(session: AsyncSession, run_id: UUID) -> list[tuple[str, str]]:
+    """Sorted (document_id, trust) of in-scope docs that are uploads or have a non-default trust.
+
+    Part of a corpus-reading node's input hash: an upload or a distrust/pin changes it (so the node
+    recomputes), while web pages the agents themselves ingest (origin=web, trust normal) do not.
+    """
+    stmt = select(Document.id, Document.trust).where(
+        or_(Document.run_id == run_id, Document.run_id.is_(None)),
+        or_(Document.origin == "upload", Document.trust != "normal"),
+    )
+    return sorted((str(i), t) for i, t in (await session.execute(stmt)).all())

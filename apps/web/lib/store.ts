@@ -3,6 +3,7 @@
 import { create } from "zustand";
 import { ApiError, BackendUnreachableError } from "./api";
 import { getBackend, type Backend } from "./backend";
+import type { ImpactPreview } from "./impact";
 import type { EventEnvelope, PersistedEvent, UUID } from "./protocol";
 import { applyEvent, emptyState, stateFromSnapshot, type RunState } from "./reducer";
 import type { ConnectionState, Subscription } from "./socket";
@@ -23,12 +24,17 @@ interface RunStore {
   connection: ConnectionState;
   loadError: LoadError | null;
   loading: boolean;
+  /** Boxes highlighted on the canvas while an action's impact preview is open (transient UI state). */
+  impactPreview: ImpactPreview | null;
 
   open: (runId: UUID) => Promise<void>;
   close: () => void;
   receive: (e: EventEnvelope) => void;
   scrubTo: (seq: number | null) => void;
   select: (id: UUID | null) => void;
+  setImpactPreview: (p: ImpactPreview) => void;
+  /** Clears the preview, but only if `owner` still owns it (or always when omitted). */
+  clearImpactPreview: (owner?: string) => void;
 }
 
 let sub: Subscription | null = null;
@@ -63,6 +69,7 @@ export const useRunStore = create<RunStore>((set, get) => ({
   connection: "closed",
   loadError: null,
   loading: false,
+  impactPreview: null,
 
   open: async (runId) => {
     const token = ++openToken;
@@ -77,6 +84,7 @@ export const useRunStore = create<RunStore>((set, get) => ({
       selectedNodeId: null,
       loadError: null,
       loading: true,
+      impactPreview: null,
       connection: "connecting",
     });
     try {
@@ -109,7 +117,15 @@ export const useRunStore = create<RunStore>((set, get) => ({
     openToken++;
     sub?.close();
     sub = null;
-    set({ runId: null, live: null, log: [], scrubSeq: null, historical: null, selectedNodeId: null });
+    set({
+      runId: null,
+      live: null,
+      log: [],
+      scrubSeq: null,
+      historical: null,
+      selectedNodeId: null,
+      impactPreview: null,
+    });
   },
 
   receive: (e) =>
@@ -139,6 +155,9 @@ export const useRunStore = create<RunStore>((set, get) => ({
     }),
 
   select: (id) => set({ selectedNodeId: id }),
+  setImpactPreview: (p) => set({ impactPreview: p }),
+  clearImpactPreview: (owner) =>
+    set((s) => (s.impactPreview && (owner === undefined || s.impactPreview.owner === owner) ? { impactPreview: null } : s)),
 }));
 
 /** The state the UI should render: live, or the folded historical state while scrubbing. */

@@ -5,6 +5,13 @@
  * Living Brief graph node by node, nodes that stream token deltas, a critic that grows
  * the graph mid-run, a judge that moves claim confidences, a human-input gate, and the
  * steer / edit / rerun / restore / veto / trust actions with stale-and-recompute.
+ * Agent nodes make scripted tool calls (tool.call → tool.result, nested sub-agent calls and
+ * agent.message exchanges for the judge's rebuttals) so the Activity UI can be demoed offline.
+ * Critics and the judge also use the cross-agent context tools (read_agent_output, list_agent_runs,
+ * search_context, read_agent_trace; results get a `ctx_…` ref served by getContext), and the judge
+ * makes one request_upstream_work per run (applied as an agent-sourced steer after it finishes; a
+ * repeat on its rerun is rejected). A user Rerun reproduces the same output, so its stale descendants
+ * come back with `reason: "upstream unchanged"` (early cutoff). Impact previews and PATCH are simulated.
  *
  * It emits contract-shaped events and keeps its own state with the same `applyEvent`
  * fold the UI uses, so the mock can never drift from the reducer's semantics.
@@ -14,18 +21,25 @@ import { ApiError } from "./api";
 import type { Backend } from "./backend";
 import type {
   Claim,
+  ContextItem,
   CreatedBy,
   Document,
   Edge,
   EventEnvelope,
   EventPayloads,
   EventType,
+  ImpactAction,
+  ImpactOut,
   Node,
+  NodePatch,
   NodeType,
   NodeVersion,
   RankedChunk,
   RunSnapshot,
   RunSummary,
+  ToolChunk,
+  TraceStep,
+  TraceRead,
   Trust,
   UUID,
   VersionReason,
@@ -44,6 +58,52 @@ const rand = (a: number, b: number) => a + Math.random() * (b - a);
 const pick = <T,>(xs: readonly T[]): T => xs[Math.floor(Math.random() * xs.length)] as T;
 
 class Cancelled extends Error {}
+
+/** Soft per-tool budgets per agent, mirroring the backend's defaults (shown as "step/budget"). */
+const BUDGETS: Partial<Record<string, Partial<Record<string, number>>>> = {
+  plan: { list_documents: 1, search_documents: 2 },
+  research: { web_search: 2, search_documents: 5, read_source: 6 },
+  critic: { request_follow_up_research: 1, read_agent_output: 4 },
+  prosecutor: { web_search: 1, search_documents: 4, read_source: 3 },
+  defender: { web_search: 1, search_documents: 4, read_source: 3 },
+  judge: { read_source: 6, ask_rebuttal: 2, list_agent_runs: 2, search_context: 3, read_agent_trace: 3 },
+};
+
+/** Tool results the backend doesn't put in the context store (no `ref`). */
+const UNSTORED = new Set([
+  "add_node",
+  "add_edge",
+  "finish_plan",
+  "list_agent_runs",
+  "recall",
+  "request_follow_up_research",
+  "request_upstream_work",
+]);
+
+const ctxRef = () => `ctx_${Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, "0")}`;
+
+interface ToolOutcome {
+  summary: string;
+  ok?: boolean;
+  error?: string | null;
+  chunks?: RankedChunk[];
+  node_ids?: UUID[];
+  /** full result text stored in the context store (defaults to summary + chunk texts) */
+  text?: string;
+  /** upstream agents a context tool read */
+  reads?: TraceRead[];
+}
+
+const toToolChunk = (c: RankedChunk): ToolChunk => ({
+  chunk_id: c.chunk_id,
+  document_id: c.document_id,
+  title: c.document_title,
+  score: c.score,
+  trust: c.trust,
+  snippet: c.text.slice(0, 240),
+});
+
+const short = (id: string) => id.slice(0, 8);
 
 type Listener = (e: EventEnvelope) => void;
 
@@ -92,6 +152,15 @@ class MockRun {
   private critiquedOnce = false;
   private claimIds: UUID[] = [];
   private inputTimers = new Map<UUID, ReturnType<typeof setTimeout>>();
+  /** critic id → follow-up research node it requested (edge to claims added after the critic finishes) */
+  private followUps = new Map<UUID, UUID>();
+  private editorRetried = false;
+  /** context store: ref → stored tool result */
+  readonly contexts = new Map<string, ContextItem>();
+  /** request_upstream_work: requester+target pairs already asked this run */
+  private upstreamAsked = new Set<string>();
+  /** requester node id → accepted requests, applied after the requester's version persists */
+  private upstreamPending = new Map<UUID, { target: UUID; instruction: string }[]>();
 
   constructor(id: UUID, goal: string, private docs: Document[]) {
     this.id = id;
@@ -130,9 +199,16 @@ class MockRun {
   snapshot(): RunSnapshot {
     const s = this.state;
     const versions: Record<UUID, NodeVersion> = {};
+    const activity: Record<UUID, TraceStep[]> = {};
+    const attempts: Record<UUID, string> = {};
     for (const id of s.nodeOrder) {
       const v = currentVersion(s, id);
       if (v) versions[id] = { ...v, retrievals: s.retrievals[v.id] };
+      if (s.nodes[id]!.status === "running") {
+        activity[id] = s.activity[id] ?? [];
+        const a = s.attempts[id];
+        if (a) attempts[id] = a;
+      }
     }
     return {
       run: { ...s.run!, status: s.runStatus },
@@ -142,6 +218,8 @@ class MockRun {
       claims: s.claimOrder.map((id) => s.claims[id]!),
       documents: Object.values(s.documents),
       last_seq: s.lastSeq,
+      activity,
+      attempts,
     };
   }
 
@@ -197,8 +275,92 @@ class MockRun {
   }
 
   private setStatus(id: UUID, status: Node["status"], reason?: string) {
+    // Entering running always starts a new attempt (even a steer restart of a running node).
+    if (status === "running") {
+      this.emit("node.status", id, { status, reason: reason ?? null, attempt_id: uid() });
+      return;
+    }
     if (this.state.nodes[id]?.status === status) return;
     this.emit("node.status", id, { status, reason: reason ?? null });
+  }
+
+  private checkCancelled(task: Task) {
+    if (task.cancelled || this.state.runStatus === "cancelled") throw new Cancelled();
+  }
+
+  /**
+   * One scripted tool call: tool.call → (300–1200ms, cancellable) → run() → tool.result.
+   * `run` receives the call id so it can nest sub-agent calls / agent.message under it.
+   */
+  private async tool(
+    nodeId: UUID,
+    task: Task,
+    tool: string,
+    args: Record<string, unknown>,
+    argsSummary: string,
+    run: (callId: string) => ToolOutcome | Promise<ToolOutcome>,
+    opts: { agent?: string; parent?: string; delay?: readonly [number, number] } = {},
+  ): Promise<ToolOutcome> {
+    this.checkCancelled(task);
+    const attempt = this.state.attempts[nodeId] ?? "";
+    const agent = opts.agent ?? this.state.nodes[nodeId]!.type;
+    const prior = (this.state.activity[nodeId] ?? []).filter((x) => x.tool === tool && (x.agent ?? "") === agent);
+    const callId = uid();
+    this.emit("tool.call", nodeId, {
+      attempt_id: attempt,
+      call_id: callId,
+      tool,
+      args,
+      args_summary: argsSummary.slice(0, 300),
+      agent,
+      parent_call_id: opts.parent ?? null,
+      step: prior.length + 1,
+      budget: BUDGETS[agent]?.[tool] ?? null,
+    });
+    const t0 = performance.now();
+    const [lo, hi] = opts.delay ?? [300, 1200];
+    await wait(rand(lo, hi));
+    this.checkCancelled(task);
+    const out = await run(callId);
+    this.checkCancelled(task);
+    let ref: string | null = null;
+    if (!UNSTORED.has(tool) && (out.ok ?? true)) {
+      ref = ctxRef();
+      const chunks = out.chunks ?? [];
+      this.contexts.set(ref, {
+        run_id: this.id,
+        ref,
+        node_id: nodeId,
+        attempt_id: attempt,
+        node_version_id: null,
+        agent,
+        parent_ref: null,
+        kind: tool === "ask_rebuttal" ? "rebuttal" : "tool_result",
+        tool,
+        args,
+        ok: out.ok ?? true,
+        text:
+          out.text ??
+          [out.summary, ...chunks.map((c) => `<source chunk_id="${c.chunk_id}" title="${c.document_title}">\n${c.text}\n</source>`)].join("\n\n"),
+        summary: `[${ref}] ${tool}(${argsSummary.slice(0, 60)}) -> ${out.summary}`,
+        chunk_ids: chunks.map((c) => c.chunk_id),
+        tokens_est: Math.round(((out.text ?? out.summary).length + chunks.reduce((n, c) => n + c.text.length, 0)) / 4),
+        created_at: now(),
+      });
+    }
+    this.emit("tool.result", nodeId, {
+      attempt_id: attempt,
+      call_id: callId,
+      ok: out.ok ?? true,
+      summary: out.summary.slice(0, 300),
+      error: out.error ?? null,
+      ms: Math.round(performance.now() - t0),
+      chunks: (out.chunks ?? []).map(toToolChunk),
+      node_ids: out.node_ids ?? [],
+      ref,
+      reads: out.reads ?? [],
+    });
+    return out;
   }
 
   private markStale(ids: UUID[], reason: string) {
@@ -233,6 +395,42 @@ class MockRun {
     const goal = this.state.run!.goal;
     const plan = this.addNode("plan", "plan", "Plan the investigation", "planner", { instructions: goal });
     this.setStatus(plan, "running");
+    const task: Task = { cancelled: false };
+    this.tasks.set(plan, task);
+    try {
+      await this.planGraph(plan, goal, task);
+    } catch (err) {
+      if (!(err instanceof Cancelled)) throw err;
+    } finally {
+      if (this.tasks.get(plan) === task) this.tasks.delete(plan);
+    }
+  }
+
+  /** Planner agent: list_documents, then add_node / add_edge tool calls build the graph. */
+  private async planGraph(plan: UUID, goal: string, task: Task) {
+    const node = (key: string, type: NodeType, title: string, config: Node["config"] = {}) =>
+      this.tool(
+        plan,
+        task,
+        "add_node",
+        { key, type, title },
+        `${type} · ${title}`,
+        () => ({ summary: `Added ${key}`, node_ids: [this.addNode(key, type, title, "planner", config)] }),
+        { delay: [280, 560] },
+      ).then((r) => r.node_ids![0]!);
+    const edge = (a: UUID, b: UUID) => {
+      const ka = this.state.nodes[a]!.key;
+      const kb = this.state.nodes[b]!.key;
+      return this.tool(
+        plan,
+        task,
+        "add_edge",
+        { source: ka, target: kb },
+        `${ka} → ${kb}`,
+        () => (this.addEdge(a, b), { summary: "Connected" }),
+        { delay: [50, 120] },
+      );
+    };
 
     const subqs = [
       ["research-timelines", "OEM production timelines", "Which automakers have committed dates and volumes?"],
@@ -247,43 +445,44 @@ class MockRun {
       "ask you one framing question, and have the editor write the brief.\n\n",
       ...subqs.map(([, t, q]) => `- **${t}**: ${q}\n`),
     ];
-    const stream = this.streamText(plan, planText.join(""), { cancelled: false }, 30);
+    const stream = this.streamText(plan, planText.join(""), task, 30);
+    stream.catch(() => {}); // awaited below
+
+    await this.tool(plan, task, "list_documents", {}, "run scope", () => ({
+      summary: `${this.docs.length} documents in scope (${this.docs.filter((d) => d.origin === "upload").length} uploaded)`,
+    }), { delay: [250, 500] });
 
     const research: UUID[] = [];
     for (const [key, title, q] of subqs) {
-      await wait(rand(450, 700));
-      const id = this.addNode(key, "research", title, "planner", { question: q });
-      this.addEdge(plan, id);
+      const id = await node(key, "research", title, { question: q });
+      await edge(plan, id);
       research.push(id);
     }
-    await wait(500);
-    const claims = this.addNode("claims", "claims", "Extract claims", "planner");
-    for (const r of research) this.addEdge(r, claims);
-    await wait(450);
-    const pros = this.addNode("prosecutor", "prosecutor", "Prosecutor", "planner");
-    const def = this.addNode("defender", "defender", "Defender", "planner");
-    this.addEdge(claims, pros);
-    this.addEdge(claims, def);
-    await wait(450);
-    const judge = this.addNode("judge", "judge", "Judge confidence", "planner");
-    this.addEdge(pros, judge);
-    this.addEdge(def, judge);
-    this.addEdge(claims, judge);
-    await wait(350);
-    const gate = this.addNode("audience", "human_input", "Who is this brief for?", "planner", {
+    const claims = await node("claims", "claims", "Extract claims");
+    for (const r of research) await edge(r, claims);
+    const pros = await node("prosecutor", "prosecutor", "Prosecutor");
+    const def = await node("defender", "defender", "Defender");
+    await edge(claims, pros);
+    await edge(claims, def);
+    const judge = await node("judge", "judge", "Judge confidence");
+    await edge(pros, judge);
+    await edge(def, judge);
+    await edge(claims, judge);
+    const gate = await node("audience", "human_input", "Who is this brief for?", {
       prompt: "Who is the audience for this brief, and how long should it be?",
     });
-    this.addEdge(judge, gate);
-    await wait(350);
-    const editor = this.addNode("editor", "editor", "Write the brief", "planner");
-    this.addEdge(judge, editor);
-    this.addEdge(gate, editor);
+    await edge(judge, gate);
+    const editor = await node("editor", "editor", "Write the brief");
+    await edge(judge, editor);
+    await edge(gate, editor);
     for (const r of research) {
-      await wait(250);
       const key = this.state.nodes[r]!.key.replace("research-", "critic-");
-      const c = this.addNode(key, "critic", `Critic: ${this.state.nodes[r]!.title}`, "planner");
-      this.addEdge(r, c);
+      const c = await node(key, "critic", `Critic: ${this.state.nodes[r]!.title}`);
+      await edge(r, c);
     }
+    await this.tool(plan, task, "finish_plan", {}, "", () => ({
+      summary: `Plan ready: ${this.state.nodeOrder.length} steps`,
+    }), { delay: [150, 300] });
     await stream;
     this.finishVersion(plan, "initial", { subquestions: subqs.map((s) => s[2]), rationale: "decompose" }, planText.join(""));
     this.setStatus(plan, "done");
@@ -371,6 +570,26 @@ class MockRun {
 
   private finishVersion(id: UUID, reason: VersionReason, output: unknown, text: string, steer: string | null = null) {
     const prev = this.state.versions[id] ?? [];
+    // The attempt's tool calls become the version's persisted trace.
+    const trace: TraceStep[] =
+      this.state.nodes[id]?.status === "running"
+        ? (this.state.activity[id] ?? []).map((st) => ({
+            call_id: st.call_id,
+            tool: st.tool,
+            agent: st.agent,
+            parent_call_id: st.parent_call_id,
+            args_summary: st.args_summary,
+            ok: st.ok ?? false,
+            summary: st.summary,
+            chunk_ids: st.chunk_ids,
+            node_ids: st.node_ids,
+            ms: st.ms,
+            ts: st.ts,
+            exchange: st.exchange.map(({ from_agent, to_agent, kind, text }) => ({ from_agent, to_agent, kind, text })),
+            ref: st.ref ?? null,
+            reads: st.reads ?? [],
+          }))
+        : [];
     const v: NodeVersion = {
       id: uid(),
       node_id: id,
@@ -384,6 +603,7 @@ class MockRun {
       tokens_in: Math.round(rand(800, 4000)),
       tokens_out: Math.round(text.length / 4),
       created_at: now(),
+      trace,
     };
     this.emit("node.version", id, { version: v, reused: false });
     return v;
@@ -396,17 +616,27 @@ class MockRun {
     const node = this.state.nodes[id]!;
     // consume pending steers
     const pending = (this.state.steers[id] ?? []).filter((x) => !x.consumed);
-    for (const p of pending) this.emit("steer.consumed", id, { steer_id: p.steer_id, text: p.text });
+    for (const p of pending) this.emit("steer.consumed", id, { steer_id: p.steer_id, text: p.text, source: p.source });
     const steer = steerText ?? pending.map((p) => p.text).join("\n") ?? null;
     this.setStatus(id, "running", reason === "initial" ? undefined : reason);
     try {
       await wait(rand(200, 600));
-      const { text, output, chunks } = await this.produce(node, task, steer || null);
+      const before = currentVersion(this.state, id);
+      const produced = await this.produce(node, task, steer || null);
       if (task.cancelled) throw new Cancelled();
+      // A plain Rerun reproduces the same content (same output_hash): early cutoff downstream.
+      const identical = reason === "retry" && !steer && !!before;
+      const { text, output } = identical ? { text: before.output_text, output: before.output } : produced;
+      const chunks = identical ? this.state.retrievals[before.id] ?? produced.chunks : produced.chunks;
       const v = this.finishVersion(id, steer && reason !== "retry" ? "steer" : reason, output, text, steer || null);
       if (chunks) this.emit("retrieval.done", id, { node_version_id: v.id, chunks });
+      for (const item of this.contexts.values()) {
+        if (item.node_id === id && item.attempt_id === this.state.attempts[id]) item.node_version_id = v.id;
+      }
       this.setStatus(id, "done");
-      if (node.type === "critic") this.maybeGrow(id);
+      if (identical) this.earlyCutoff(id);
+      if (node.type === "critic") this.attachFollowUp(id);
+      this.applyUpstreamRequests(id);
     } catch (err) {
       if (!(err instanceof Cancelled)) {
         this.emit("error", id, { message: String(err), node_id: id });
@@ -415,6 +645,68 @@ class MockRun {
     } finally {
       if (this.tasks.get(id) === task) this.tasks.delete(id);
     }
+  }
+
+  /** Stale descendants whose inputs came back unchanged go back to done, reusing their version. */
+  private earlyCutoff(id: UUID) {
+    for (const d of this.activeDescendants(id)) {
+      const n = this.state.nodes[d]!;
+      if (n.removed || n.status !== "stale" || this.tasks.has(d)) continue;
+      const v = currentVersion(this.state, d);
+      const parentsDone = parentsOf(this.state, d).every((p) => {
+        const pn = this.state.nodes[p]!;
+        return pn.removed || pn.status === "done";
+      });
+      if (!v || !parentsDone) continue;
+      this.emit("node.version", d, { version: v, reused: true });
+      this.setStatus(d, "done", "upstream unchanged");
+    }
+  }
+
+  /** request_upstream_work: after the requester's version persists, steer each target (source agent:<key>). */
+  private applyUpstreamRequests(requester: UUID) {
+    const reqs = this.upstreamPending.get(requester);
+    if (!reqs?.length) return;
+    this.upstreamPending.delete(requester);
+    const from = this.state.nodes[requester]!.key;
+    for (const { target, instruction } of reqs) {
+      const t = this.state.nodes[target];
+      if (!t || t.removed) continue;
+      const text = `Request from ${from}: ${instruction}`;
+      this.emit("steer.queued", target, { steer_id: uid(), text, source: `agent:${from}` });
+      this.markStale(this.descendants(target), `upstream ${t.key} changed`);
+      this.ensureRunning();
+      void this.runNode(target, "steer");
+    }
+  }
+
+  /** Body of the judge's request_upstream_work (mirrors the backend's acceptance rules). */
+  private requestUpstream(requester: UUID, targetKey: string, instruction: string): ToolOutcome {
+    const from = this.state.nodes[requester]!.key;
+    const target = this.byKey(targetKey);
+    const no = (error: string, summary: string): ToolOutcome => ({ ok: false, error, summary });
+    if (!target) return no(`unknown node ${targetKey}; call list_agent_runs()`, "unknown node");
+    const pair = `${from}->${targetKey}`;
+    if (this.upstreamAsked.has(pair))
+      return no(`you already asked ${targetKey} once in this run; use its current output`, "already requested");
+    this.upstreamAsked.add(pair);
+    const list = this.upstreamPending.get(requester) ?? [];
+    list.push({ target, instruction });
+    this.upstreamPending.set(requester, list);
+    return { summary: `→ ${targetKey}: ${instruction}`, node_ids: [target] };
+  }
+
+  /** Transitive active ancestors (what a context tool may read). */
+  private ancestors(id: UUID): UUID[] {
+    const seen = new Set<UUID>();
+    const stack = parentsOf(this.state, id);
+    while (stack.length) {
+      const n = stack.pop()!;
+      if (seen.has(n) || this.state.nodes[n]?.removed) continue;
+      seen.add(n);
+      stack.push(...parentsOf(this.state, n));
+    }
+    return this.state.nodeOrder.filter((n) => seen.has(n));
   }
 
   private retrieve(): RankedChunk[] {
@@ -435,20 +727,51 @@ class MockRun {
     return chunks;
   }
 
-  private maybeGrow(criticId: UUID) {
-    if (this.critiquedOnce) return;
-    const critic = this.state.nodes[criticId]!;
-    if (!critic.key.includes("manufacturing")) return;
+  /** Body of the critic's request_follow_up_research tool: adds the node + critic→fu edge. */
+  private growFollowUp(criticId: UUID): UUID | null {
+    const pending = this.followUps.get(criticId);
+    if (pending) return pending;
+    if (this.critiquedOnce) return null;
     this.critiquedOnce = true;
-    const claims = this.byKey("claims");
-    if (!claims) return;
     const id = this.addNode("research-manufacturing_fu", "research", "Electrolyte supply chain", "critic", {
       question: "Is there enough lithium-metal and sulfide electrolyte capacity to scale?",
     });
     this.addEdge(criticId, id);
+    this.followUps.set(criticId, id);
+    return id;
+  }
+
+  /** After the critic's version persists: wire the follow-up into claims (stale-and-recompute). */
+  private attachFollowUp(criticId: UUID) {
+    const id = this.followUps.get(criticId);
+    if (!id) return;
+    this.followUps.delete(criticId);
+    const claims = this.byKey("claims");
+    if (!claims) return;
     this.addEdge(id, claims);
     const st = this.state.nodes[claims]!.status;
     if (st === "running" || st === "done") this.markStale([claims, ...this.descendants(claims)], "new input from critic");
+  }
+
+  /** Scripted retrieval for a tool: `n` fresh passages from in-scope, trusted docs. */
+  private take(found: RankedChunk[], n: number): RankedChunk[] {
+    const cs = this.retrieve().slice(0, n);
+    found.push(...cs);
+    return cs;
+  }
+
+  /** Unique chunks, best first, re-ranked. */
+  private ranked(found: RankedChunk[], max = 8): RankedChunk[] {
+    const seen = new Set<string>();
+    return found
+      .filter((c) => (seen.has(c.chunk_id) ? false : (seen.add(c.chunk_id), true)))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, max)
+      .map((c, i) => ({ ...c, rank: i + 1 }));
+  }
+
+  private searchSummary(cs: RankedChunk[]): string {
+    return cs.length ? `${cs.length} passage${cs.length > 1 ? "s" : ""}, top score ${cs[0]!.score.toFixed(2)}` : "No passages";
   }
 
   private async produce(
@@ -460,7 +783,34 @@ class MockRun {
     const steerLine = steer ? `\n\n> Steered: _${steer}_\n` : "";
     switch (node.type) {
       case "research": {
-        const chunks = this.retrieve();
+        const q = String(node.config.question ?? node.title);
+        const found: RankedChunk[] = [];
+        await this.tool(node.id, task, "web_search", { query: q }, q, () => {
+          const cs = this.take(found, 2);
+          return { summary: `Ingested ${cs.length} new page${cs.length === 1 ? "" : "s"} from ${cs.length + 3} results`, chunks: cs };
+        });
+        const queries = [
+          `${node.title.toLowerCase()} 2027 2028 targets`,
+          pick(["independent test data", "analyst forecasts", "pilot line yield", "cost per kWh projection"]),
+        ];
+        for (const query of queries) {
+          await this.tool(node.id, task, "search_documents", { query, k: 6 }, query, () => {
+            const cs = this.take(found, 3);
+            return { summary: this.searchSummary(cs), chunks: cs };
+          });
+        }
+        const best = [...found].sort((a, b) => b.score - a.score)[0];
+        if (best) {
+          await this.tool(
+            node.id,
+            task,
+            "read_source",
+            { chunk_id: best.chunk_id },
+            `[${short(best.chunk_id)}] ${best.document_title}`,
+            () => ({ summary: `Read the passage and 2 neighbours from “${best.document_title}”`, chunks: [best] }),
+          );
+        }
+        const chunks = this.ranked(found, 6);
         const pts = chunks.slice(0, 3).map((c) => c.text);
         const text =
           `### ${node.title}\n\n_${node.config.question ?? ""}_${steerLine}\n\n` +
@@ -477,7 +827,26 @@ class MockRun {
         };
       }
       case "critic": {
-        const thin = node.key.includes("manufacturing") && !this.critiquedOnce;
+        const research = parentsOf(this.state, node.id).find((p) => this.state.nodes[p]?.type === "research");
+        if (research) {
+          const rk = this.state.nodes[research]!.key;
+          const out = currentVersion(this.state, research)?.output_text ?? "";
+          await this.tool(node.id, task, "read_agent_output", { node_key: rk, offset: 0 }, rk, () => ({
+            summary: `${rk} v${currentVersion(this.state, research)?.version ?? 1}: ${out.length} chars (page 1/1)`,
+            text: `<source agent="${rk}" kind="output">\n${out}\n</source>`,
+            reads: [{ node_key: rk }],
+          }), { delay: [250, 600] });
+        }
+        const thin = node.key.includes("manufacturing") && (!this.critiquedOnce || this.followUps.has(node.id));
+        if (thin) {
+          const question = "Is there enough lithium-metal and sulfide electrolyte capacity to scale?";
+          await this.tool(node.id, task, "request_follow_up_research", { question }, question, () => {
+            const id = this.growFollowUp(node.id);
+            return id
+              ? { summary: "Added a follow-up research step", node_ids: [id] }
+              : { summary: "A follow-up was already requested this run", ok: false, error: "follow-up cap reached" };
+          });
+        }
         const text = thin
           ? "**Verdict: thin.** The manufacturing track ignores upstream material supply. Adding a follow-up research question on electrolyte and lithium-metal capacity."
           : `**Verdict: ok.** Coverage is adequate; sources are ${pick(["recent and diverse", "mostly primary", "consistent with each other"])}.`;
@@ -505,6 +874,20 @@ class MockRun {
       case "prosecutor":
       case "defender": {
         const attack = node.type === "prosecutor";
+        const found: RankedChunk[] = [];
+        // One search per claim (soft budget 4), run in parallel pairs like the real agent's read tools.
+        const keys = CLAIMS.slice(0, 4).map((_, i) => `C${i + 1}`);
+        for (let i = 0; i < keys.length; i += 2) {
+          await Promise.all(
+            keys.slice(i, i + 2).map((k) => {
+              const query = `${k} ${attack ? "counter-evidence, delays, failures" : "supporting evidence, funded lines"}`;
+              return this.tool(node.id, task, "search_documents", { query, k: 4 }, query, () => {
+                const cs = this.take(found, Math.random() < 0.5 ? 1 : 2);
+                return { summary: this.searchSummary(cs), chunks: cs };
+              });
+            }),
+          );
+        }
         const lines = CLAIMS.map(
           (_, i) =>
             `- **C${i + 1}**: ${
@@ -515,9 +898,108 @@ class MockRun {
         );
         const text = `### ${attack ? "Case against" : "Case for"}${steerLine}\n\n${lines.join("\n")}`;
         await this.streamText(node.id, text, task, 40);
-        return { text, output: attack ? { attacks: [] } : { defenses: [] } };
+        return { text, output: attack ? { attacks: [] } : { defenses: [] }, chunks: this.ranked(found) };
       }
       case "judge": {
+        const found: RankedChunk[] = [];
+        const upstream = this.ancestors(node.id).map((a) => this.state.nodes[a]!);
+        await this.tool(node.id, task, "list_agent_runs", {}, "", () => ({
+          summary: `${upstream.length} upstream agents: ${upstream.map((n) => n.key).join(", ")}`,
+        }), { delay: [150, 300] });
+        const researchKeys = upstream.filter((n) => n.type === "research").map((n) => n.key);
+        const ctxQuery = "cycle life beyond 1,000 cycles";
+        await this.tool(node.id, task, "search_context", { query: ctxQuery, k: 5 }, ctxQuery, () => {
+          const hits = researchKeys.slice(0, 2);
+          return {
+            summary: `${hits.length} matches in ${hits.join(", ") || "upstream work"}`,
+            text: hits
+              .map((k) => `<source agent="${k}" kind="output">\n…independent cycle-life data beyond 1,000 cycles is still sparse…\n</source>`)
+              .join("\n\n"),
+            reads: hits.map((k) => ({ node_key: k })),
+          };
+        }, { delay: [250, 500] });
+        if (upstream.some((n) => n.key === "prosecutor")) {
+          await this.tool(node.id, task, "read_agent_trace", { node_key: "prosecutor" }, "prosecutor", () => ({
+            summary: "prosecutor: 4 searches, 6 passages",
+            text: '<source agent="prosecutor" kind="trace">\nsearch_documents ×4 → 6 passages; no web searches\n</source>',
+            reads: [{ node_key: "prosecutor" }],
+          }), { delay: [200, 400] });
+        }
+        const perf = researchKeys.find((k) => k.includes("performance")) ?? researchKeys[0];
+        if (perf) {
+          const instruction = "Find independent cycle-life data beyond 1,000 cycles, not manufacturer claims.";
+          await this.tool(
+            node.id,
+            task,
+            "request_upstream_work",
+            { target_node_key: perf, instruction },
+            `target_node_key=${perf}, instruction=${instruction}`,
+            () => this.requestUpstream(node.id, perf, instruction),
+            { delay: [200, 400] },
+          );
+        }
+        const evidence = Object.values(this.state.retrievals).flat();
+        const disputed = evidence.length ? pick(evidence) : null;
+        if (disputed) {
+          await this.tool(
+            node.id,
+            task,
+            "read_source",
+            { chunk_id: disputed.chunk_id },
+            `[${short(disputed.chunk_id)}] ${disputed.document_title}`,
+            () => (found.push(disputed), { summary: `Read “${disputed.document_title}” in context`, chunks: [disputed] }),
+          );
+        }
+        const claimKey = this.state.claims[this.claimIds[0] ?? ""]?.key ?? "C1";
+        const question = `On ${claimKey}: is there any delivered volume, or only announcements? Cite it.`;
+        await this.tool(
+          node.id,
+          task,
+          "ask_rebuttal",
+          { claim_key: claimKey, side: "prosecutor", question },
+          `${claimKey} → prosecutor: ${question}`,
+          async (callId) => {
+            const attempt = this.state.attempts[node.id] ?? "";
+            this.emit("agent.message", node.id, {
+              attempt_id: attempt,
+              call_id: callId,
+              from_agent: "judge",
+              to_agent: "prosecutor",
+              kind: "question",
+              text: question,
+              chunk_ids: [],
+            });
+            const query = `${claimKey} delivered volume vs announced`;
+            const r = await this.tool(
+              node.id,
+              task,
+              "search_documents",
+              { query, k: 4 },
+              query,
+              () => {
+                const cs = this.take(found, 2);
+                return { summary: this.searchSummary(cs), chunks: cs };
+              },
+              { agent: "prosecutor", parent: callId },
+            );
+            await wait(rand(400, 800));
+            this.checkCancelled(task);
+            const cites = r.chunks ?? [];
+            this.emit("agent.message", node.id, {
+              attempt_id: attempt,
+              call_id: callId,
+              from_agent: "prosecutor",
+              to_agent: "judge",
+              kind: "answer",
+              text: `Only announcements. The sources describe pilot lines and A-samples; none report deliveries above pilot scale${
+                cites.length ? ` ${cites.map((c) => `[${short(c.chunk_id)}]`).join(" ")}` : ""
+              }.`,
+              chunk_ids: cites.map((c) => c.chunk_id),
+            });
+            return { summary: `Prosecutor answered citing ${cites.length} passage${cites.length === 1 ? "" : "s"}`, chunks: cites };
+          },
+          { delay: [200, 400] },
+        );
         const header = `### Verdicts${steerLine}\n\n`;
         let text = header;
         this.emit("node.delta", node.id, { text: header }, false);
@@ -563,7 +1045,7 @@ class MockRun {
           }
           verdicts.push({ claim_key: claim.key, confidence: conf, rationale, strike });
         }
-        return { text, output: { verdicts } };
+        return { text, output: { verdicts }, chunks: found.length ? this.ranked(found) : undefined };
       }
       case "editor": {
         const claims = this.claimIds.map((id) => this.state.claims[id]).filter((c): c is Claim => !!c && c.status === "active");
@@ -579,6 +1061,14 @@ class MockRun {
           `## What we're confident about\n\n` +
           claims.map((c) => `- ${c.text}${hedge(c)} (${Math.round((c.confidence ?? 0) * 100)}%)`).join("\n") +
           `\n\n## What would change our mind\n\n- A disclosed yield above 90% on a GWh-scale line.\n- A sub-$90/kWh cost commitment from a top-3 cell maker.\n`;
+        if (!this.editorRetried) {
+          // Demo a validator retry: a first draft streams, is rejected, and the buffer resets.
+          this.editorRetried = true;
+          await this.streamText(node.id, `# Brief: ${goal}\n\n**Bottom line:** solid-state EVs are coming (C9) `, task, 28);
+          await wait(500);
+          this.checkCancelled(task);
+          this.emit("node.delta", node.id, { text: "", reset: true }, false);
+        }
         await this.streamText(node.id, text, task, 28);
         return { text, output: { markdown: text } };
       }
@@ -601,9 +1091,9 @@ class MockRun {
   steer(id: UUID, text: string) {
     const n = this.node(id);
     const steerId = uid();
-    this.emit("steer.queued", id, { steer_id: steerId, text });
+    this.emit("steer.queued", id, { steer_id: steerId, text, source: "user" });
     if (n.status === "running" || n.status === "done" || n.status === "failed") {
-      if (n.status !== "running") this.markStale(this.descendants(id), "upstream steered");
+      if (n.status !== "running") this.markStale(this.descendants(id), `upstream ${n.key} changed`);
       this.ensureRunning();
       void this.runNode(id, "steer");
     }
@@ -614,24 +1104,24 @@ class MockRun {
     this.cancelTask(id);
     const v = this.finishVersion(id, "edit", { edited: true }, outputText);
     if (n.status !== "done") this.setStatus(id, "done");
-    this.markStale(this.descendants(id), "upstream edited");
+    this.markStale(this.descendants(id), `upstream ${n.key} changed`);
     return v;
   }
 
   rerun(id: UUID) {
-    this.node(id);
-    this.markStale(this.descendants(id), "upstream rerun");
+    const n = this.node(id);
+    this.markStale(this.descendants(id), `upstream ${n.key} changed`);
     this.ensureRunning();
     void this.runNode(id, "retry");
   }
 
   restore(id: UUID, versionId: UUID) {
-    this.node(id);
+    const n = this.node(id);
     if (!this.state.versions[id]?.some((v) => v.id === versionId)) throw new ApiError("Unknown version", 404);
     this.cancelTask(id);
     this.emit("node.restored", id, { version_id: versionId });
     this.setStatus(id, "done");
-    this.markStale(this.descendants(id), "upstream restored");
+    this.markStale(this.descendants(id), `upstream ${n.key} changed`);
   }
 
   veto(id: UUID) {
@@ -648,6 +1138,69 @@ class MockRun {
         this.setStatus(d, "skipped", "lost all inputs");
       } else this.markStale([d], "upstream vetoed");
     }
+  }
+
+  /** Active descendants in topological order (Kahn over the descendant subgraph, insertion order ties). */
+  private activeDescendants(id: UUID): UUID[] {
+    const desc = new Set(this.descendants(id).filter((d) => !this.state.nodes[d]!.removed));
+    const order: UUID[] = [];
+    const done = new Set<UUID>([id]);
+    while (order.length < desc.size) {
+      const next = this.state.nodeOrder.find(
+        (d) => desc.has(d) && !done.has(d) && parentsOf(this.state, d).every((p) => !desc.has(p) || done.has(p)),
+      );
+      if (!next) break;
+      done.add(next);
+      order.push(next);
+    }
+    return order;
+  }
+
+  impact(id: UUID, action: ImpactAction): ImpactOut {
+    const n = this.node(id);
+    if (n.removed) return { action, node_ids: [], skipped_ids: [], upper_bound: true };
+    const desc = this.activeDescendants(id);
+    if (action === "veto") {
+      const gone = new Set<UUID>([id]);
+      const node_ids: UUID[] = [];
+      const skipped_ids: UUID[] = [];
+      for (const d of desc) {
+        const live = parentsOf(this.state, d).filter((p) => !gone.has(p) && !this.state.nodes[p]!.removed);
+        if (live.length) node_ids.push(d);
+        else {
+          gone.add(d);
+          skipped_ids.push(d);
+        }
+      }
+      return { action, node_ids, skipped_ids, upper_bound: true };
+    }
+    const self = action === "steer" || action === "rerun" || action === "config";
+    return { action, node_ids: self ? [id, ...desc] : desc, skipped_ids: [], upper_bound: true };
+  }
+
+  patch(id: UUID, body: NodePatch): Node {
+    const n = this.node(id);
+    if (n.removed) throw new ApiError("node was removed", 409);
+    if (body.title === undefined && body.question === undefined && body.instructions === undefined)
+      throw new ApiError("nothing to change: give title, question or instructions", 422);
+    if (body.question !== undefined && n.type !== "research")
+      throw new ApiError("question is only valid on research nodes", 422);
+    const config = { ...n.config };
+    if (body.question !== undefined) config.question = body.question || null;
+    if (body.instructions !== undefined) config.instructions = body.instructions || null;
+    const title = body.title?.trim() || n.title;
+    const same =
+      title === n.title &&
+      (config.question ?? null) === (n.config.question ?? null) &&
+      (config.instructions ?? null) === (n.config.instructions ?? null);
+    if (same) return n;
+    const next: Node = { ...n, title, config };
+    this.emit("node.updated", id, { node: next });
+    this.cancelTask(id);
+    if (n.status !== "pending") this.setStatus(id, "stale", "config changed");
+    this.markStale(this.descendants(id), `upstream ${n.key} changed`);
+    this.ensureRunning();
+    return this.state.nodes[id]!;
   }
 
   setTrust(docId: UUID, trust: Trust): Document {
@@ -734,6 +1287,14 @@ export function createMockBackend(): Backend {
     restore: (nodeId, vid) => later(() => withNode(nodeId, (r) => r.restore(nodeId, vid))),
     answer: (nodeId, a) => later(() => withNode(nodeId, (r) => r.answer(nodeId, a))),
     veto: (nodeId) => later(() => withNode(nodeId, (r) => r.veto(nodeId))),
+    impact: (nodeId, action) => later(() => withNode(nodeId, (r) => r.impact(nodeId, action))),
+    patchNode: (nodeId, body) => later(() => withNode(nodeId, (r) => r.patch(nodeId, body))),
+    getContext: (runId, ref) =>
+      later(() => {
+        const item = runs.get(runId)?.contexts.get(ref);
+        if (!item) throw new ApiError("context item not found", 404);
+        return item;
+      }),
     uploadDocument: (file, runId) =>
       later(() => {
         const d: Document = {

@@ -8,6 +8,7 @@ def test_reasoning_only_for_configured_node_types(monkeypatch):
     monkeypatch.setattr(settings, "openrouter_api_key", "test-key")
     monkeypatch.setattr(settings, "reasoning_fast", False)
     monkeypatch.setattr(settings, "reasoning_nodes", "prosecutor,defender")
+    monkeypatch.setattr(settings, "reasoning_smart", None)
     models.clear_overrides()
     models._openrouter.cache_clear()
 
@@ -21,4 +22,7 @@ def test_reasoning_only_for_configured_node_types(monkeypatch):
     assert models.model_for("prosecutor", "fast") is not models.model_for("research", "fast")
     assert models.uses_prompted_output(models.model_for("prosecutor", "fast"))
     assert models.model_for("judge", "smart").settings is None or "openrouter_reasoning" not in models.model_for("judge", "smart").settings
+    models._openrouter.cache_clear()
+    monkeypatch.setattr(settings, "reasoning_smart", False)
+    assert models.model_for("judge", "smart").settings.get("openrouter_reasoning") == {"enabled": False}
     models._openrouter.cache_clear()

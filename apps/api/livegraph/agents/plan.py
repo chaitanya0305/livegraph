@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
-
 from pydantic import BaseModel, Field
-from pydantic_ai import Agent, RunContext
 
-from livegraph.agents.base import AgentContext, format_instructions, format_steer
+from livegraph.agents.base import AgentContext, AgentFactory, AgentLimits, format_instructions, format_steer
+from livegraph.agents.tools import graph_tools, rag_tools
 
 TYPE = "plan"
 TIER = "smart"
@@ -20,14 +17,6 @@ class PlanOutput(BaseModel):
 
 
 Output = PlanOutput
-
-
-@dataclass
-class PlannerDeps:
-    add_node: Callable[..., Awaitable[str]]
-    add_edge: Callable[[str, str], Awaitable[str]]
-    finish_plan: Callable[[], Awaitable[str]]
-    finished: list[bool] = field(default_factory=list)
 
 
 SYSTEM = """You are the Planner of LiveGraph, a system that researches a goal and writes a "Living Brief".
@@ -48,43 +37,20 @@ The node with key `plan` already exists (it is you). Add nodes before edges that
 When done, call `finish_plan`, then return your final output: the list of sub-questions and a one
 paragraph rationale."""
 
-agent: Agent[PlannerDeps, PlanOutput] = Agent(
-    output_type=PlanOutput, deps_type=PlannerDeps, instructions=SYSTEM, retries=2, name="planner"
+TOOL_SYSTEM = """
+
+Before planning you may call `list_documents()` once to see what the user supplied, and
+`search_documents(query)` (at most twice) to see what they cover, so the research questions target real
+gaps. Then build the graph."""
+
+LIMITS = AgentLimits(request_limit=20, timeout=360, budgets={"list_documents": 1, "search_documents": 2, "fetch_page": 1})
+
+agents = AgentFactory(
+    "planner", PlanOutput, SYSTEM, tool_system=TOOL_SYSTEM,
+    base_tools=[graph_tools.ADD_NODE, graph_tools.ADD_EDGE, graph_tools.FINISH_PLAN],
+    tools=[graph_tools.LIST_DOCUMENTS, rag_tools.SEARCH, rag_tools.FETCH],
 )
-
-
-@agent.tool
-async def add_node(
-    ctx: RunContext[PlannerDeps],
-    key: str,
-    type: str,
-    title: str,
-    question: str | None = None,
-    instructions: str | None = None,
-) -> str:
-    """Add a node to the graph.
-
-    Args:
-        key: short unique slug, e.g. r1, c1, claims, judge.
-        type: one of research, critic, claims, prosecutor, defender, judge, editor, human_input.
-        title: short human readable title.
-        question: for research nodes, the research question.
-        instructions: optional extra instructions for the node (for human_input: the question for the user).
-    """
-    return await ctx.deps.add_node(key=key, type=type, title=title, question=question, instructions=instructions)
-
-
-@agent.tool
-async def add_edge(ctx: RunContext[PlannerDeps], source_key: str, target_key: str) -> str:
-    """Add a dependency edge: target runs after source and receives its output."""
-    return await ctx.deps.add_edge(source_key, target_key)
-
-
-@agent.tool
-async def finish_plan(ctx: RunContext[PlannerDeps]) -> str:
-    """Signal that the graph is complete."""
-    ctx.deps.finished.append(True)
-    return await ctx.deps.finish_plan()
+agent = agents.get()
 
 
 def build_prompt(ctx: AgentContext) -> str:

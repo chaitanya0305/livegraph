@@ -1,6 +1,11 @@
 /** Typed REST client for the LiveGraph API (see docs/CONTRACT.md §REST API). */
 import type {
+  ContextItem,
   CreateRunBody,
+  ImpactAction,
+  ImpactOut,
+  Node,
+  NodePatch,
   Document,
   EventEnvelope,
   NodeVersion,
@@ -95,6 +100,13 @@ export const api = {
     request<unknown>(`/nodes/${nodeId}/restore`, json({ version_id })),
   answer: (nodeId: UUID, answer: string) => request<unknown>(`/nodes/${nodeId}/input`, json({ answer })),
   veto: (nodeId: UUID) => request<unknown>(`/nodes/${nodeId}`, { method: "DELETE" }),
+  /** Read-only preview of the boxes an action would rerun (upper bound). */
+  impact: (nodeId: UUID, action: ImpactAction) =>
+    request<ImpactOut>(`/nodes/${nodeId}/impact?action=${encodeURIComponent(action)}`),
+  patchNode: (nodeId: UUID, body: NodePatch) =>
+    request<Node>(`/nodes/${nodeId}`, { method: "PATCH", body: JSON.stringify(body) }),
+  getContext: (runId: UUID, ref: string) =>
+    request<ContextItem>(`/runs/${runId}/context/${encodeURIComponent(ref)}`),
 
   uploadDocument: (file: File, runId?: UUID) => {
     const fd = new FormData();

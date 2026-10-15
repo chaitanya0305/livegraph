@@ -121,7 +121,7 @@ export const Markdown = memo(function Markdown({
   );
 });
 
-function Citation({ id, chunk }: { id: string; chunk?: RankedChunk }) {
+export function Citation({ id, chunk }: { id: string; chunk?: RankedChunk }) {
   return (
     <span className="group/cite relative inline-block align-baseline">
       <span

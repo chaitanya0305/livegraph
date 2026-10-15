@@ -6,8 +6,10 @@ import { useEffect, useMemo, useState } from "react";
 import { splitRows } from "@/lib/diffRows";
 import type { Node, NodeVersion } from "@/lib/protocol";
 import { useReadOnly, useRunStore, useView } from "@/lib/store";
-import { REASON_TONE, relativeTime } from "../meta";
+import { splitSteerText } from "@/lib/reducer";
+import { REASON_TONE, relativeTime, traceSummary } from "../meta";
 import { Button, SectionLabel, cx } from "../ui";
+import { ImpactConfirm } from "./ImpactConfirm";
 import { useAction } from "./useAction";
 
 export function VersionsTab({ node }: { node: Node }) {
@@ -100,42 +102,75 @@ function VersionRow({
   readOnly: boolean;
 }) {
   const action = useAction();
+  const [confirming, setConfirming] = useState(false);
   return (
     <li
       className={cx(
-        "group flex items-start gap-3 rounded-lg px-2.5 py-2 transition-colors",
+        "group rounded-lg px-2.5 py-2 transition-colors",
         current ? "bg-surface ring-1 ring-line-strong" : "hover:bg-sunken",
       )}
     >
-      <span className="mt-0.5 w-7 shrink-0 font-mono text-[12.5px] font-medium text-ink tabular-nums">v{v.version}</span>
-      <div className="min-w-0 flex-1">
-        <div className="flex flex-wrap items-center gap-1.5">
-          <span className={cx("rounded px-1.5 py-px text-[11px] font-medium", REASON_TONE[v.reason] ?? "bg-sunken text-ink-2")}>
-            {v.reason}
-          </span>
-          {current ? <span className="text-[11px] font-medium text-green-ink">current</span> : null}
-          <span className="text-[11px] text-ink-4">{relativeTime(v.created_at)}</span>
+      <div className="flex items-start gap-3">
+        <span className="mt-0.5 w-7 shrink-0 font-mono text-[12.5px] font-medium text-ink tabular-nums">v{v.version}</span>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className={cx("rounded px-1.5 py-px text-[11px] font-medium", REASON_TONE[v.reason] ?? "bg-sunken text-ink-2")}>
+              {v.reason}
+            </span>
+            {current ? <span className="text-[11px] font-medium text-green-ink">current</span> : null}
+            <span className="text-[11px] text-ink-4">{relativeTime(v.created_at)}</span>
+          </div>
+          {v.steer_text ? <SteerLine text={v.steer_text} /> : null}
+          {v.trace?.length ? (
+            <p className="mt-0.5 truncate text-[11.5px] text-sky-ink" title={`${v.trace.length} tool calls`}>
+              {traceSummary(v.trace) || `${v.trace.length} tool calls`}
+            </p>
+          ) : null}
+          {action.error ? <p className="mt-1 text-[11.5px] text-red-ink">{action.error}</p> : null}
         </div>
-        {v.steer_text ? <p className="mt-1 line-clamp-2 text-[12px] text-ink-2">“{v.steer_text}”</p> : null}
-        {action.error ? <p className="mt-1 text-[11.5px] text-red-ink">{action.error}</p> : null}
+        <div className="flex shrink-0 items-center gap-1">
+          <CompareToggle label="A" active={isA} onClick={onA} />
+          <CompareToggle label="B" active={isB} onClick={onB} />
+          {!current && !readOnly ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              title="Make this the current version; downstream steps recompute"
+              aria-pressed={confirming}
+              onClick={() => setConfirming((c) => !c)}
+            >
+              <History className="size-3.5" />
+              Restore
+            </Button>
+          ) : null}
+        </div>
       </div>
-      <div className="flex shrink-0 items-center gap-1">
-        <CompareToggle label="A" active={isA} onClick={onA} />
-        <CompareToggle label="B" active={isB} onClick={onB} />
-        {!current && !readOnly ? (
-          <Button
-            size="sm"
-            variant="ghost"
-            title="Make this the current version; downstream steps recompute"
-            loading={action.pending === "restore"}
-            onClick={() => action.run("restore", (b) => b.restore(nodeId, v.id))}
-          >
-            {action.pending !== "restore" ? <History className="size-3.5" /> : null}
-            Restore
-          </Button>
-        ) : null}
-      </div>
+      {confirming && !current && !readOnly ? (
+        <ImpactConfirm
+          className="mt-2"
+          nodeId={nodeId}
+          action="restore"
+          confirmLabel={`Restore v${v.version}`}
+          pending={action.pending === "restore"}
+          onCancel={() => setConfirming(false)}
+          onConfirm={async () => {
+            if (await action.run("restore", (b) => b.restore(nodeId, v.id))) setConfirming(false);
+          }}
+        />
+      ) : null}
     </li>
+  );
+}
+
+function SteerLine({ text }: { text: string }) {
+  const { agent, text: body } = splitSteerText(text.split("\n")[0] ?? text);
+  return (
+    <p className="mt-1 line-clamp-2 text-[12px] text-ink-2">
+      <span className={cx("mr-1 text-[11px] font-medium", agent ? "text-violet" : "text-accent-ink")}>
+        {agent ? `from ${agent}` : "from you"}
+      </span>
+      “{agent ? body : text}”
+    </p>
   );
 }
 

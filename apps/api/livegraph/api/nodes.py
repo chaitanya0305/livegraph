@@ -2,14 +2,25 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import select
 
 from livegraph.db import base as db_base
 from livegraph.db.models import Node, NodeVersion
 from livegraph.engine import engine
-from livegraph.engine.serialize import version_out
-from livegraph.protocol import Accepted, EditBody, InputBody, NodeVersionOut, RestoreBody, SteerBody
+from livegraph.engine.serialize import node_out, version_out
+from livegraph.protocol import (
+    Accepted,
+    EditBody,
+    ImpactAction,
+    ImpactOut,
+    InputBody,
+    NodeOut,
+    NodePatch,
+    NodeVersionOut,
+    RestoreBody,
+    SteerBody,
+)
 
 router = APIRouter(tags=["nodes"])
 
@@ -23,6 +34,20 @@ async def versions(node_id: UUID) -> list[NodeVersionOut]:
             await s.execute(select(NodeVersion).where(NodeVersion.node_id == node_id).order_by(NodeVersion.version))
         ).scalars()
         return [await version_out(s, v) for v in rows]
+
+
+@router.get("/nodes/{node_id}/impact", response_model=ImpactOut)
+async def impact(node_id: UUID, action: ImpactAction = Query(...)) -> ImpactOut:
+    """Read-only preview of the nodes an action would rerun (no state change, no events)."""
+    return ImpactOut.model_validate(await engine.impact(node_id, action))
+
+
+@router.patch("/nodes/{node_id}", response_model=NodeOut)
+async def patch(node_id: UUID, body: NodePatch) -> NodeOut:
+    if body.title is None and body.question is None and body.instructions is None:
+        raise HTTPException(422, "nothing to change: give title, question or instructions")
+    n = await engine.patch(node_id, title=body.title, question=body.question, instructions=body.instructions)
+    return node_out(n)
 
 
 @router.post("/nodes/{node_id}/steer", status_code=202, response_model=Accepted)

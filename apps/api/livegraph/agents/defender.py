@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
-from pydantic_ai import Agent
 
-from livegraph.agents.base import AgentContext, cite
+from livegraph.agents import debate, validators
+from livegraph.agents.base import AgentContext, AgentFactory, cite
 from livegraph.agents.debate import build_debate_prompt
 
 TYPE = "defender"
@@ -29,7 +29,13 @@ it using the evidence. Cite exact `chunk_id`s (verbatim UUIDs from the evidence 
 Never invent chunk ids. If a claim is genuinely indefensible, say so plainly. One defense per claim,
 referencing it by `claim_key` (C1, C2, ...)."""
 
-agent: Agent[None, DefenderOutput] = Agent(output_type=DefenderOutput, instructions=SYSTEM, retries=2, name="defender")
+LIMITS = debate.LIMITS
+
+agents = AgentFactory(
+    "defender", DefenderOutput, SYSTEM, tool_system=debate.TOOL_SYSTEM, tools=debate.TOOLS,
+    validator=validators.defender,
+)
+agent = agents.get()
 
 
 def build_prompt(ctx: AgentContext) -> str:

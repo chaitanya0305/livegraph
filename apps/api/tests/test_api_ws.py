@@ -14,6 +14,16 @@ import websockets
 from tests.util import start_run, upload_docs, wait_run
 
 
+def live_buffer(deltas: list[dict], node_id: str) -> str:
+    """What a client shows: append each delta, or replace the buffer on ``reset``."""
+    buf = ""
+    for e in deltas:
+        if e["node_id"] != node_id:
+            continue
+        buf = e["payload"]["text"] if e["payload"].get("reset") else buf + e["payload"]["text"]
+    return buf
+
+
 def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -58,9 +68,15 @@ async def test_ws_live_stream_and_replay_since(server, fake):
     deltas = [e for e in live if e["type"] == "node.delta"]
     assert deltas and all(e["seq"] is None and e["node_id"] for e in deltas)
     editor_id = next(n["id"] for n in snap["nodes"] if n["key"] == "editor")
-    streamed = "".join(e["payload"]["text"] for e in deltas if e["node_id"] == editor_id)
-    assert streamed == snap["versions"][editor_id]["output_text"]
+    for n in snap["nodes"]:  # every node's live buffer (resets applied) ends as its output_text
+        assert live_buffer(deltas, n["id"]) == snap["versions"][n["id"]]["output_text"], n["key"]
     assert len([e for e in deltas if e["node_id"] == editor_id]) > 1
+    # research: the validator bounced an invented chunk id (ModelRetry) -> the streamed draft was reset
+    r1_id = next(n["id"] for n in snap["nodes"] if n["key"] == "r1")
+    assert any(e["payload"].get("reset") for e in deltas if e["node_id"] == r1_id)
+    # tool activity is persisted, never streamed as text
+    assert any(e["type"] == "tool.call" and e["seq"] is not None for e in live)
+    assert not any("web_search" in e["payload"]["text"] for e in deltas)
     # deltas for a node arrive before its node.version
     idx_v = next(i for i, e in enumerate(live) if e["type"] == "node.version" and e["node_id"] == editor_id)
     assert max(i for i, e in enumerate(live) if e["type"] == "node.delta" and e["node_id"] == editor_id) < idx_v

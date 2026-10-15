@@ -2,7 +2,7 @@
 
 import { ExternalLink, Pin, ShieldOff } from "lucide-react";
 import type { Node, RankedChunk, Trust } from "@/lib/protocol";
-import { currentVersion } from "@/lib/reducer";
+import { currentVersion, effectiveStatus } from "@/lib/reducer";
 import { useReadOnly, useView } from "@/lib/store";
 import { cx } from "../ui";
 import { useAction } from "./useAction";
@@ -12,6 +12,36 @@ const NO_CHUNKS: RankedChunk[] = [];
 export function SourcesTab({ node }: { node: Node }) {
   const version = useView((s) => currentVersion(s, node.id));
   const chunks = useView((s) => (version ? s.retrievals[version.id] ?? version.retrievals ?? NO_CHUNKS : NO_CHUNKS));
+  const provisional = useView((s) => s.provisional[node.id] ?? NO_CHUNKS);
+  const running = effectiveStatus(node) === "running";
+
+  // While the agent is working, show what its tools have pulled in so far, then the previous version's sources.
+  if (running && provisional.length) {
+    const fresh = new Set(provisional.map((c) => c.chunk_id));
+    const previous = [...chunks].filter((c) => !fresh.has(c.chunk_id)).sort((a, b) => a.rank - b.rank);
+    return (
+      <div>
+        <p className="px-5 pt-3 text-[11.5px] text-ink-3">
+          Found so far this run. Final ranking lands when the step finishes.
+        </p>
+        <ol className="divide-y divide-line">
+          {provisional.map((c) => (
+            <ChunkRow key={c.chunk_id} chunk={c} provisional />
+          ))}
+        </ol>
+        {previous.length ? (
+          <>
+            <p className="border-t border-line px-5 pt-3 text-[11.5px] text-ink-4">From the previous version</p>
+            <ol className="divide-y divide-line opacity-70">
+              {previous.map((c) => (
+                <ChunkRow key={c.chunk_id} chunk={c} />
+              ))}
+            </ol>
+          </>
+        ) : null}
+      </div>
+    );
+  }
 
   if (!chunks.length) {
     return (
@@ -32,7 +62,7 @@ export function SourcesTab({ node }: { node: Node }) {
   );
 }
 
-function ChunkRow({ chunk }: { chunk: RankedChunk }) {
+function ChunkRow({ chunk, provisional }: { chunk: RankedChunk; provisional?: boolean }) {
   const docTrust = useView((s) => s.documents[chunk.document_id]?.trust);
   const trust: Trust = docTrust ?? chunk.trust;
   const readOnly = useReadOnly();
@@ -43,6 +73,9 @@ function ChunkRow({ chunk }: { chunk: RankedChunk }) {
     <li className={cx("px-5 py-3.5", trust === "distrusted" && "opacity-60")}>
       <div className="flex items-center gap-2">
         <span className="font-mono text-[11px] text-ink-4 tabular-nums">#{chunk.rank}</span>
+        {provisional ? (
+          <span className="shrink-0 rounded bg-sky-soft px-1.5 text-[10.5px] font-medium text-sky-ink">live</span>
+        ) : null}
         <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium" title={chunk.document_title}>
           {chunk.document_title}
         </span>

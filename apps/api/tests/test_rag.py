@@ -60,6 +60,7 @@ async def session(rag_engine):
         yield s
     rag.set_embedder(None)
     rag.set_web_client(None)
+    rag.set_exa_transport(None)
 
 
 LONG_TEXT = "\n\n".join(
@@ -373,4 +374,106 @@ async def test_web_research_parses_citations(session, monkeypatch):
 async def test_web_research_swallows_errors(session, monkeypatch):
     monkeypatch.setattr(rag_web.settings, "web_search", True)
     rag.set_web_client(_FakeClient(exc=ConnectionError("boom")))
+    assert await rag.web_research(session, run_id=uuid.uuid4(), query="q") == []
+
+
+# ---------------------------------------------------------------- web research via Exa (offline MockTransport)
+
+
+def _exa_transport(payload: dict | None = None, status: int = 200):
+    import json
+
+    import httpx
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(status, json=payload if payload is not None else {"error": "bad"})
+
+    t = httpx.MockTransport(handler)
+    t.seen = seen  # type: ignore[attr-defined]
+    t.body = lambda i=0: json.loads(seen[i].content)  # type: ignore[attr-defined]
+    return t
+
+
+def test_web_provider_resolution(monkeypatch):
+    monkeypatch.setattr(rag_web.settings, "web_provider", "auto")
+    monkeypatch.setattr(rag_web.settings, "exa_api_key", "")
+    assert rag.web_provider() == "openrouter"
+    monkeypatch.setattr(rag_web.settings, "exa_api_key", "k")
+    assert rag.web_provider() == "exa"
+    rag.set_web_client(SimpleNamespace())  # a test override of the OpenRouter client wins in auto
+    assert rag.web_provider() == "openrouter"
+    rag.set_web_client(None)
+    monkeypatch.setattr(rag_web.settings, "web_provider", "OpenRouter")
+    assert rag.web_provider() == "openrouter"
+    monkeypatch.setattr(rag_web.settings, "web_provider", "exa")
+    monkeypatch.setattr(rag_web.settings, "exa_api_key", "")
+    assert rag.web_provider() == "exa"
+
+
+def test_parse_exa_results():
+    out = rag_web.parse_exa_results(
+        {
+            "results": [
+                {"url": "https://a.org/x", "title": "A", "highlights": ["first bit", "  ", "second bit"]},
+                {"url": "https://a.org/x", "title": "dup", "highlights": ["ignored"]},
+                {"url": "https://b.org", "title": None, "text": "full text fallback"},
+                {"url": "", "title": "no url"},
+            ]
+        }
+    )
+    assert out == [
+        {"url": "https://a.org/x", "title": "A", "content": "first bit\n\nsecond bit"},
+        {"url": "https://b.org", "title": "https://b.org", "content": "full text fallback"},
+    ]
+
+
+async def test_web_research_exa(session, monkeypatch):
+    monkeypatch.setattr(rag_web.settings, "web_search", True)
+    monkeypatch.setattr(rag_web.settings, "web_provider", "exa")
+    monkeypatch.setattr(rag_web.settings, "exa_api_key", "test-key")
+    rag.set_web_client(SimpleNamespace())  # must not be used when the provider is exa
+    transport = _exa_transport(
+        {
+            "requestId": "r1",
+            "results": [
+                {
+                    "url": "https://nrel.gov/pv",
+                    "title": "NREL Efficiency Chart",
+                    "highlights": ["Perovskite-silicon tandem cells hit 34 percent efficiency in 2025."],
+                },
+                {"url": "https://x.com/a", "title": "X post", "highlights": ["Other note about solar."]},
+            ],
+        }
+    )
+    rag.set_exa_transport(transport)
+    run_id = uuid.uuid4()
+    docs = await rag.web_research(session, run_id=run_id, query="perovskite efficiency", max_results=4)
+    await session.commit()
+
+    req = transport.seen[0]
+    assert req.method == "POST" and str(req.url) == f"{settings.exa_base_url}/search"
+    assert req.headers["x-api-key"] == "test-key"
+    assert transport.body() == {
+        "query": "perovskite efficiency", "type": "auto", "numResults": 4, "contents": {"highlights": True},
+    }
+    assert [d.source_url for d in docs] == ["https://nrel.gov/pv", "https://x.com/a"]
+    assert all(d.origin == "web" and d.run_id == run_id for d in docs)
+    res = await rag.search(session, run_id=run_id, query="perovskite tandem efficiency")
+    assert res[0].document_id == docs[0].id and "34 percent" in res[0].text
+
+
+async def test_web_research_exa_noop_without_key(session, monkeypatch):
+    monkeypatch.setattr(rag_web.settings, "web_search", True)
+    monkeypatch.setattr(rag_web.settings, "web_provider", "exa")
+    monkeypatch.setattr(rag_web.settings, "exa_api_key", "")
+    assert await rag.web_research(session, run_id=uuid.uuid4(), query="anything") == []
+
+
+async def test_web_research_exa_swallows_errors(session, monkeypatch):
+    monkeypatch.setattr(rag_web.settings, "web_search", True)
+    monkeypatch.setattr(rag_web.settings, "web_provider", "exa")
+    rag.set_exa_transport(_exa_transport(status=401))
     assert await rag.web_research(session, run_id=uuid.uuid4(), query="q") == []

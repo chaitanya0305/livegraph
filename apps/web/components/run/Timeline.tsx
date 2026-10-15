@@ -14,6 +14,9 @@ const TICK_H: Partial<Record<string, number>> = {
   "claim.confidence": 0.7,
   "claim.upserted": 0.6,
   "run.status": 1,
+  "tool.call": 0.4,
+  "tool.result": 0.3,
+  "agent.message": 0.65,
   error: 1,
 };
 

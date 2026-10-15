@@ -39,6 +39,11 @@
   --violet-soft: oklch(0.96 0.03 305);
   --teal: oklch(0.6 0.09 205);
 
+  /* sky = agent tool activity (searches, reads, rebuttals) */
+  --sky: oklch(0.66 0.12 232);
+  --sky-ink: oklch(0.47 0.11 236);
+  --sky-soft: oklch(0.96 0.025 232);
+
   --ease-out: cubic-bezier(0.22, 1, 0.36, 1); /* quint-ish */
   --ease-expo: cubic-bezier(0.16, 1, 0.3, 1);
 }
@@ -69,6 +74,9 @@
   --color-violet: var(--violet);
   --color-violet-soft: var(--violet-soft);
   --color-teal: var(--teal);
+  --color-sky: var(--sky);
+  --color-sky-ink: var(--sky-ink);
+  --color-sky-soft: var(--sky-soft);
   --font-sans: var(--font-plex-sans), ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: var(--font-plex-mono), ui-monospace, "SF Mono", Menlo, monospace;
 }
@@ -361,6 +369,35 @@ body {
 }
 .md-compact h2 {
   font-size: 0.95rem;
+}
+
+/* Impact preview: boxes an action would rerun (or skip) while its inline confirm is open. */
+@keyframes lg-impact-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+.lg-impact-rerun::after,
+.lg-impact-skip::after {
+  content: "";
+  position: absolute;
+  inset: -6px;
+  border-radius: 15px;
+  pointer-events: none;
+  animation: lg-impact-in 200ms var(--ease-out);
+}
+.lg-impact-rerun::after {
+  border: 2px solid var(--accent);
+  background: oklch(0.62 0.2 262 / 0.05);
+}
+.lg-impact-skip::after {
+  border: 2px dashed var(--red);
+  background: oklch(0.58 0.19 27 / 0.05);
 }
 
 @media (prefers-reduced-motion: reduce) {
