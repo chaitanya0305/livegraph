@@ -1,8 +1,8 @@
 """Output validators (``@agent.output_validator``): bounce bad outputs back to the model with ``ModelRetry``.
 
-They are skipped for partial (streaming) outputs. Once the output-retry budget is spent they repair the
-output instead (the old ``sanitize`` behaviour: drop what is invalid), so a stubborn model degrades
-gracefully rather than failing the node.
+They are skipped for partial (streaming) outputs. Once the output-retry budget is spent, or the run has used
+the last request its hard cap allows, they repair the output instead (the old ``sanitize`` behaviour: drop
+what is invalid), so a stubborn model degrades gracefully rather than failing the node.
 """
 
 from __future__ import annotations
@@ -22,8 +22,14 @@ def _active(ctx: RunContext[NodeDeps | None]) -> bool:
     return not ctx.partial_output and isinstance(ctx.deps, NodeDeps)
 
 
+def _out_of_requests(ctx: RunContext[Any]) -> bool:
+    """A retry would need one more request than the run's hard cap allows (deps.request_cap, see base.wind_down)."""
+    cap = getattr(ctx.deps, "request_cap", None)
+    return cap is not None and ctx.usage.requests >= cap
+
+
 def _retry_or(ctx: RunContext[Any], problems: list[str], repair: Callable[[], Any]) -> Any:
-    if problems and ctx.retry < ctx.max_retries:
+    if problems and ctx.retry < ctx.max_retries and not _out_of_requests(ctx):
         raise ModelRetry("Fix these problems and answer again: " + "; ".join(problems[:8]))
     return repair()
 

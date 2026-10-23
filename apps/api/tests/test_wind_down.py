@@ -103,3 +103,24 @@ async def test_final_requests_tell_the_model_tools_are_gone() -> None:
     await run_agent(agent, "go", model=FunctionModel(greedy, stream_function=stream), render=lambda o: o.answer,
                     deps=Deps(), limits=UsageLimits(request_limit=5))
     assert seen == [(True, False), (True, False), (True, False), (False, True)]
+
+
+def test_validator_repairs_instead_of_retrying_on_the_last_request() -> None:
+    from types import SimpleNamespace
+
+    from pydantic_ai import ModelRetry
+
+    from livegraph.agents.validators import _retry_or
+
+    repaired: list[bool] = []
+
+    def ctx(requests: int, cap: int | None) -> SimpleNamespace:
+        return SimpleNamespace(retry=0, max_retries=2, usage=SimpleNamespace(requests=requests),
+                               deps=SimpleNamespace(request_cap=cap))
+
+    with pytest.raises(ModelRetry):  # requests left: bounce it back to the model
+        _retry_or(ctx(8, 10), ["bad id"], lambda: repaired.append(True))
+    _retry_or(ctx(10, 10), ["bad id"], lambda: repaired.append(True))  # last allowed request: repair
+    assert repaired == [True]
+    with pytest.raises(ModelRetry):  # no cap known: old behaviour
+        _retry_or(ctx(50, None), ["bad id"], lambda: None)
