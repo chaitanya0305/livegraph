@@ -732,7 +732,8 @@ def register(subparsers: Any) -> None:
     p.add_argument("--out", type=Path, default=None, help="results root (default eval-results/)")
     p.add_argument("--tag", default=None, help="run tag; pass an existing one to resume")
     p.add_argument("--api-url", default="http://localhost:8000")
-    p.add_argument("--spawn", action="store_true", help="start an API server instead of using --api-url")
+    p.add_argument("--spawn", action="store_true",
+                   help="start an API server with the `full` config env (study models) instead of using --api-url")
     p.set_defaults(func=cmd_recompute)
 
 
@@ -781,9 +782,11 @@ async def run_cli(args: argparse.Namespace) -> int:
                     log(f"{t.run_id}: failed: {e}")
 
     if args.spawn:
+        from lgeval.runners.configs import CONFIGS
         from lgeval.server import ApiServer
 
-        async with ApiServer(log_path=store.dir / "api.log") as srv:
+        # the source runs are `full` runs: recompute them with the same models/knobs (not apps/api/.env's)
+        async with ApiServer(CONFIGS["full"].env, log_path=store.dir / "api.log") as srv:
             await go(srv.base_url)
     else:
         await go(args.api_url)
