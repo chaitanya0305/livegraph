@@ -330,3 +330,11 @@ def test_import_external_briefs(tmp_path: Path, capsys):
     stored = ResultStore(out, "import", run_tag="x").read("runs", RunRecord)
     assert len(stored) == 2 and (out / "import" / "x" / "manifest.json").exists()
     assert cli.main(["import", "--system", "s", "--dir", str(tmp_path / "missing"), "--out", str(out)]) == 2
+
+
+def test_editor_done_marks_partial_runs() -> None:
+    from lgeval.runners.quality import _editor_done
+
+    snap = {"nodes": [{"type": "critic", "status": "failed"}, {"type": "editor", "status": "done"}]}
+    assert _editor_done(snap)
+    assert not _editor_done({"nodes": [{"type": "editor", "status": "pending"}]})

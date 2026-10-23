@@ -33,7 +33,7 @@ When the verdict is `thin`, FIRST call `request_follow_up_research(question)` ex
 follow-up question (it adds a research node to the graph that runs before the claims are drafted), then
 return your verdict with the same `follow_up_question`. Never call it for `ok` research."""
 
-LIMITS = AgentLimits(request_limit=4, timeout=90, budgets={"request_follow_up_research": 1})
+LIMITS = AgentLimits(request_limit=6, timeout=90, budgets={"request_follow_up_research": 1})
 
 agents = AgentFactory(
     "critic", CriticOutput, SYSTEM, tool_system=TOOL_SYSTEM, tools=[graph_tools.FOLLOW_UP, *context_tools.TOOLS]

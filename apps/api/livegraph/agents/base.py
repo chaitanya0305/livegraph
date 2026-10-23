@@ -35,10 +35,24 @@ FINAL_REQUESTS = 2
 async def wind_down(ctx: Any, tool_defs: list[Any]) -> list[Any]:
     """PrepareTools capability: hide the function tools for the last FINAL_REQUESTS requests under ``deps.request_cap``
     (set by ``run_agent`` from its UsageLimits); output tools are not affected."""
+    return [] if _winding_down(ctx) else tool_defs
+
+
+def _winding_down(ctx: Any) -> bool:
     cap = getattr(ctx.deps, "request_cap", None)
-    if cap is not None and ctx.usage.requests >= cap - FINAL_REQUESTS:
-        return []
-    return tool_defs
+    return cap is not None and ctx.usage.requests >= cap - FINAL_REQUESTS
+
+
+FINAL_NOTE = (
+    "\n\nYour tool budget for this run is used up and no tools are available: do not call any tool. "
+    "Return your final output now, based on what you already have."
+)
+
+
+def final_note(ctx: Any) -> str:
+    """Dynamic instruction for the wind-down requests: without it a model may keep calling the hidden tools
+    (each such call is rejected and costs a request) until the cap fails the node."""
+    return FINAL_NOTE if _winding_down(ctx) else ""
 
 
 @dataclass
@@ -193,7 +207,7 @@ class AgentFactory:
                 out = ToolOutput(self.output, name="submit")
             instructions = self.system + (self.tool_system if with_tools else "") + UNTRUSTED_NOTE
             agent: Agent[Any, Any] = Agent(
-                output_type=out, instructions=instructions, retries=self.retries, name=self.name,
+                output_type=out, instructions=[instructions, final_note], retries=self.retries, name=self.name,
                 tools=self.base_tools + (self.tools if with_tools else []), end_strategy="graceful",
                 capabilities=[compaction(), PrepareTools(wind_down)],
             )

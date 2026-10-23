@@ -106,6 +106,10 @@ async def _settle(client: LiveGraphClient, run_id: str, *, deadline: float, poll
         await asyncio.sleep(poll)
 
 
+def _editor_done(snap: dict) -> bool:
+    return any(n["type"] == "editor" and n["status"] == "done" and not n.get("removed") for n in snap.get("nodes", []))
+
+
 async def _first_error(client: LiveGraphClient, run_id: str) -> str | None:
     with contextlib.suppress(Exception):
         for e in await client.events(run_id):
@@ -152,6 +156,11 @@ async def run_one(
         rec.n_nodes = sum(1 for n in snap.get("nodes", []) if not n.get("removed"))
         rec.brief = brief_of(snap)
         rec.claims, rec.citations, rec.evidence = extract_record_parts(snap, versions)
+        if rec.status == "failed" and rec.brief.strip() and _editor_done(snap):
+            # a side node (e.g. a critic) failed but the brief was written from a complete graph: scorable
+            failed = [n["key"] for n in snap.get("nodes", []) if n["status"] == "failed" and not n.get("removed")]
+            rec.status = "partial"
+            rec.error = "; ".join(x for x in (f"failed nodes: {', '.join(failed)}", rec.error) if x)
         path = store.save_snapshot(run_id, {**snap, "node_versions": versions})
         rec.snapshot_path = str(path.relative_to(store.dir))
     except Exception as e:  # noqa: BLE001 -- recorded on the run

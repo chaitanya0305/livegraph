@@ -75,3 +75,31 @@ async def test_without_a_cap_tools_stay_on() -> None:
     agent = make_agent()
     with pytest.raises(UsageLimitExceeded):  # no request_cap on deps -> no wind-down (old behaviour)
         await agent.run("go", model=FunctionModel(greedy), deps=Deps(), usage_limits=UsageLimits(request_limit=3))
+
+
+async def test_final_requests_tell_the_model_tools_are_gone() -> None:
+    from pydantic_ai.capabilities import PrepareTools
+    from pydantic_ai.messages import ModelRequest
+
+    from livegraph.agents.base import FINAL_NOTE, final_note
+
+    seen: list[tuple[bool, bool]] = []  # (tools offered, note present) per request
+
+    async def stream(messages: list[ModelMessage], info: AgentInfo):
+        req = next(m for m in reversed(messages) if isinstance(m, ModelRequest))
+        seen.append((bool(info.function_tools), FINAL_NOTE.strip() in (req.instructions or "")))
+        async for part in greedy_stream(messages, info):
+            yield part
+
+    from pydantic_ai import PromptedOutput
+
+    agent: Agent[Deps, Out] = Agent(output_type=PromptedOutput(Out), deps_type=Deps, instructions=["Base.", final_note],
+                                    capabilities=[PrepareTools(wind_down)])
+
+    @agent.tool
+    async def search(ctx: RunContext[Deps], q: str) -> str:
+        return "result"
+
+    await run_agent(agent, "go", model=FunctionModel(greedy, stream_function=stream), render=lambda o: o.answer,
+                    deps=Deps(), limits=UsageLimits(request_limit=5))
+    assert seen == [(True, False), (True, False), (True, False), (False, True)]

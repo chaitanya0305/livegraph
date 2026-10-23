@@ -22,7 +22,7 @@ ALL_METRICS = ("factual", "citation", "accuracy", "calibration")
 # metric group -> the ScoreRecord.metric whose presence marks the group done for a run (resume)
 DONE_METRIC = {"factual": "factual_precision", "citation": "citation_recall", "accuracy": "answer_accuracy",
                "calibration": "brier"}
-SCORABLE = {"done", "imported"}
+SCORABLE = {"done", "partial", "imported"}  # partial: a side node failed, the brief is complete
 
 
 # --- io -----------------------------------------------------------------------------------------------------

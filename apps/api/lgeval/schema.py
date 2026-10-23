@@ -70,7 +70,7 @@ class RunRecord(BaseModel):
     system: str  # config name ("full", "no_debate", ...) or external system ("chatgpt_dr", "single_agent")
     repeat: int = 0
     run_id: str | None = None  # LiveGraph run id (None for external/baseline)
-    status: str  # done | failed | timeout | cancelled | imported
+    status: str  # done | partial (side node failed, brief complete) | failed | timeout | cancelled | imported
     error: str | None = None
     started_at: datetime = Field(default_factory=now)
     wall_s: float | None = None

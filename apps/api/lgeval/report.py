@@ -34,7 +34,7 @@ METRIC_LABELS = {
 }
 MUTATION_ORDER = ["identical", "distrust", "steer", "edit", "patch_question"]
 SYSTEM_ORDER = ["full", "no_debate", "no_critic", "single_shot", "no_context_tools", "single_agent"]
-OK_STATUSES = {"done", "imported"}
+OK_STATUSES = {"done", "partial", "imported"}
 REFERENCE = "full"
 N_BOOT = 2000
 N_BINS = 10
