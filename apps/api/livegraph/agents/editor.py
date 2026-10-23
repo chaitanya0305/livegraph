@@ -24,6 +24,12 @@ plainly; hedge medium-confidence claims (0.4-0.75) with words like "likely"/"som
 mention low-confidence claims (< 0.4) only as open questions. Reference claims inline as (C1), (C2).
 Start with a one-paragraph bottom line, then sections, then "Open questions"."""
 
+# no judge ran (DISABLED_NODE_TYPES ablation): claims carry no confidence
+UNJUDGED = (
+    "Claims (not judged: no confidence scores; treat each as supported by its cited evidence, state it plainly "
+    "unless its wording is itself uncertain, and leave the confidence-based hedging rules aside)"
+)
+
 LIMITS = AgentLimits(request_limit=3, timeout=300)
 
 # context tools only run with CONTEXT_TOOLS_SINGLE_SHOT=true (otherwise this stays a validated single shot)
@@ -35,8 +41,10 @@ agent = agents.get()
 
 def build_prompt(ctx: AgentContext) -> str:
     inputs = "\n\n".join(f"### {p.title} ({p.key})\n{p.output_text}" for p in ctx.parents)
+    judged = any(c.get("confidence") is not None for c in ctx.claims) or not ctx.claims
+    head = "Claims (with judged confidence)" if judged else UNJUDGED
     return (
-        f"## Goal\n{ctx.goal}\n\n## Claims (with judged confidence)\n{format_claims(ctx.claims)}\n\n"
+        f"## Goal\n{ctx.goal}\n\n## {head}\n{format_claims(ctx.claims)}\n\n"
         f"## Inputs\n{inputs or '(none)'}{format_instructions(ctx)}{format_steer(ctx)}"
     )
 

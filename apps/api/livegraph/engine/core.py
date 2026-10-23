@@ -56,7 +56,7 @@ from livegraph.agents.models import model_for
 from livegraph.agents.runner import run_agent
 from livegraph.agents.tools import context_tools
 from livegraph.agents.tools.rag_tools import web_doc_ids
-from livegraph.config import settings, tools_enabled
+from livegraph.config import disabled_types, settings, tools_enabled
 from livegraph.db import base as db_base
 from livegraph.db.models import Claim, ClaimHistory, Edge, Node, NodeVersion, Run, SteerMessage
 from livegraph.engine.hashing import input_hash, input_ref, output_hash
@@ -1039,6 +1039,8 @@ class RunScheduler:
     ) -> Node:
         if type not in SPECS:
             raise EngineError(f"unknown node type {type!r}; expected one of {sorted(SPECS)}")
+        if type in disabled_types():
+            raise EngineError(f"node type {type!r} is disabled in this deployment (DISABLED_NODE_TYPES); leave it out")
         config: dict[str, Any] = {"instructions": instructions, "params": params or {}}
         if question:
             config["question"] = question
@@ -1059,6 +1061,8 @@ class RunScheduler:
             raise EngineError(f"unknown node key: {source_key if src is None else target_key}")
         if src.id == tgt.id or g.reachable(tgt.id, src.id):
             raise EngineError(f"edge {source_key}->{target_key} would create a cycle")
+        if tgt.type == "plan":  # the plan runs first; an input would make it wait on its own graph
+            raise EngineError(f"edge {source_key}->{target_key}: the plan node takes no inputs")
         if tgt.id in g.children.get(src.id, []):
             return None
         e = Edge(run_id=self.run_id, source_node_id=src.id, target_node_id=tgt.id)
@@ -1103,8 +1107,9 @@ class RunScheduler:
             if not g.parents.get(r.id):
                 await self.add_edge(s, plan.key, r.key)
         g = await refresh()
+        off = disabled_types()
         for i, r in enumerate(of_type("research"), 1):
-            if (r.config.get("params") or {}).get("follow_up"):
+            if "critic" in off or (r.config.get("params") or {}).get("follow_up"):
                 continue
             if not any(g.nodes[c].type == "critic" for c in g.children.get(r.id, [])):
                 c = await self.add_node(s, key=unique(f"c{i}"), type="critic", title=f"Critique {r.key}")
@@ -1122,11 +1127,11 @@ class RunScheduler:
         g = await refresh()
         claim_key = claims[0].key
         for t, title in (("prosecutor", "Prosecutor"), ("defender", "Defender")):
-            if not of_type(t):
+            if not of_type(t) and t not in off:
                 await self.add_node(s, key=unique(t), type=t, title=title)
                 await self.add_edge(s, claim_key, of_type_key(await refresh(), t))
                 g = await refresh()
-        if not of_type("judge"):
+        if not of_type("judge") and "judge" not in off:
             j = await self.add_node(s, key=unique("judge"), type="judge", title="Judge")
             await self.add_edge(s, claim_key, j.key)
             g = await refresh()
@@ -1134,10 +1139,18 @@ class RunScheduler:
                 for n in of_type(t):
                     await self.add_edge(s, n.key, j.key)
             g = await refresh()
+        # the editor follows the judge; without one (DISABLED_NODE_TYPES) the debaters, else the claims
+        feeders = of_type("judge") or of_type("prosecutor") + of_type("defender") or claims
         if not of_type("editor"):
             e = await self.add_node(s, key=unique("editor"), type="editor", title="Editor")
-            for j in of_type("judge"):
-                await self.add_edge(s, j.key, e.key)
+            for f in feeders:
+                await self.add_edge(s, f.key, e.key)
+        elif off:
+            g = await refresh()
+            for e in of_type("editor"):
+                if not any(a.type == "claims" for a in g.ancestors(e.id)):
+                    for f in feeders:
+                        await self.add_edge(s, f.key, e.key)
         # any other orphan (no parents, not plan) hangs off the plan
         g = await refresh()
         for n in g.nodes.values():

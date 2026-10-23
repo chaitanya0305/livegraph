@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 from livegraph.agents.base import AgentContext, AgentFactory, AgentLimits, format_instructions, format_steer
 from livegraph.agents.tools import graph_tools, rag_tools
+from livegraph.config import disabled_types
 
 TYPE = "plan"
 TIER = "smart"
@@ -56,7 +57,21 @@ agent = agents.get()
 def build_prompt(ctx: AgentContext) -> str:
     docs = (ctx.config.get("params") or {}).get("document_titles") or []
     doc_s = ("\n\nThe user supplied these documents: " + "; ".join(docs)) if docs else ""
-    return f"## Goal\n{ctx.goal}{doc_s}{format_instructions(ctx)}{format_steer(ctx)}"
+    return f"## Goal\n{ctx.goal}{doc_s}{format_disabled()}{format_instructions(ctx)}{format_steer(ctx)}"
+
+
+def format_disabled() -> str:
+    """DISABLED_NODE_TYPES: tell the planner to leave those steps out and where the editor's edge comes from."""
+    off = disabled_types()
+    if not off:
+        return ""
+    debaters = [t for t in ("prosecutor", "defender") if t not in off]
+    feeder = "judge" if "judge" not in off else " and ".join(debaters) if debaters else "claims"
+    return (
+        f"\n\n## Disabled node types\nThese node types are disabled in this deployment: {', '.join(sorted(off))}. "
+        f"Do not add them or edges to them (add_node rejects them); skip those steps of the shape. "
+        f"Wire the editor with an edge from {feeder}."
+    )
 
 
 def render(out: PlanOutput) -> str:

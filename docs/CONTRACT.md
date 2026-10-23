@@ -28,6 +28,7 @@ OPENROUTER_API_KEY=
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 MODEL_SMART=openai/gpt-4.1                 # planner, judge, editor
 MODEL_FAST=deepseek/deepseek-v4.1-flash    # research, claims, prosecutor, defender, critic
+PROVIDER_SMART= / PROVIDER_FAST=baidu/fp8  # OpenRouter provider: one slug = preferred (falls back anywhere); a,b,c = only these, in order
 EMBED_MODEL=openai/text-embedding-3-small  # via OpenRouter /embeddings
 EMBED_DIM=1536
 WEB_SEARCH=on                              # on|off — web_search tool on/off
@@ -38,6 +39,7 @@ CORS_ORIGINS=http://localhost:3000
 # multi-agent nodes
 OUTPUT_MODE_AGENTS=prompted                # prompted|tool — how tool-using fast-tier agents return output
 AGENT_TOOLS=research,prosecutor,defender,judge,critic,plan   # kill switch: other types run single-shot
+DISABLED_NODE_TYPES=                       # ablation (lgeval): never add these types (critic|prosecutor|defender|judge|human_input); graph rewired around them
 RESEARCH_SEED_K=4                          # chunks retrieved up front as a researcher's starting evidence
 SEARCH_K_MAX=8                             # cap on search_documents k
 WEB_SEARCH_MAX_PER_NODE=2                  # researcher web_search soft budget
@@ -168,6 +170,7 @@ hash. Results are `<source …>` data. `ask_rebuttal` debaters get recall 2 / se
 - Output validators (`ModelRetry`): cited chunk ids must be ones the node was given or retrieved (research, prosecutor, defender, claims; each claim ≥1 support), exactly one verdict per claim (judge), no `(Cn)` for struck/unknown claims (editor). When retries run out the output is repaired (invalid ids dropped) instead of failing.
 - **Context store + history compaction**: every tool result (except budget-exhausted calls, graph edits, `list_agent_runs` and `recall`) is stored as a `context_items` row; the `tool.result` carries its `ref` (a cached repeat keeps the original ref). Before each model request, above `HISTORY_BUDGET_TOKENS` the content of older tool returns (> 600 chars; never the last `HISTORY_KEEP_RECENT` requests) is replaced, oldest first, by `[ctx_ab12] tool(args) -> summary [chunk_id=…] (recall('ctx_ab12') for full text)` (Pydantic AI `ProcessHistory` capability; idempotent and permanent, parts are never dropped or reordered so call/return pairing holds).
 - `AGENT_TOOLS` kill switch: a type not listed runs single-shot (research falls back to engine-side web + search; a thin critic's follow-up is added from its output; the planner keeps its graph tools).
+- `DISABLED_NODE_TYPES` ablation (lgeval; any of critic, prosecutor, defender, judge, human_input): `add_node` rejects those types with a tool error, the planner prompt lists them, and `ensure_default_shape` neither adds them nor critics' follow-ups; the editor is wired after the judge, else the remaining debaters, else claims. Without a judge the claims stay unjudged (confidence null) and the editor is told so. (Edges into `plan` are always rejected.)
 Default shape: `plan → research×(3–5) → claims → {prosecutor, defender} → judge → editor`, with
 `critic` attached after each research node.
 

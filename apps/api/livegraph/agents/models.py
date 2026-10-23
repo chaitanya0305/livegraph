@@ -34,8 +34,12 @@ def clear_overrides() -> None:
 
 
 def provider_routing(slug: str) -> dict | None:
-    """OpenRouter provider routing: prefer ``slug``, fall back to others if it is down."""
-    return {"order": [slug], "allow_fallbacks": True} if slug else None
+    """OpenRouter provider routing. One slug: prefer it, fall back to any provider if it is down.
+    A comma list (``baidu/fp8,morph/fp8``): try them in order and never leave the list (bounded price/quantization)."""
+    order = [p.strip() for p in slug.split(",") if p.strip()]
+    if not order:
+        return None
+    return {"order": order, "allow_fallbacks": len(order) == 1}
 
 
 @lru_cache(maxsize=8)

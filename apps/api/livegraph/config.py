@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     output_mode_agents: str = "prompted"
     # Node types that run as tool-using agents (comma-separated). Others fall back to single-shot calls.
     agent_tools: str = "research,prosecutor,defender,judge,critic,plan"
+    # Ablation knob (evaluation): node types never added to a graph (comma-separated, from DISABLABLE_TYPES);
+    # the default shape is rewired around them (e.g. claims -> editor without the debate). Empty = off.
+    disabled_node_types: str = ""
     research_seed_k: int = 4  # chunks the engine retrieves up front as a research agent's starting evidence
     search_k_max: int = 8  # cap on `k` for the search_documents tool
     web_search_max_per_node: int = 2  # soft cap on web_search calls per research node
@@ -71,6 +74,14 @@ class Settings(BaseSettings):
 def tools_enabled(node_type: str) -> bool:
     """AGENT_TOOLS kill switch: True when ``node_type`` runs as a tool-using agent."""
     return node_type in {t.strip() for t in settings.agent_tools.split(",") if t.strip()}
+
+
+DISABLABLE_TYPES = ("critic", "prosecutor", "defender", "judge", "human_input")
+
+
+def disabled_types() -> set[str]:
+    """DISABLED_NODE_TYPES ablation knob: node types the planner/engine never add (unknown names ignored)."""
+    return {t.strip() for t in settings.disabled_node_types.split(",") if t.strip()} & set(DISABLABLE_TYPES)
 
 
 @lru_cache
