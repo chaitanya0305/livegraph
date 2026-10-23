@@ -39,6 +39,7 @@ class NodeDeps:
     # scope rule for the context tools: {node_key: current version id} of transitive active ancestors
     readable: dict[str, UUID] = field(default_factory=dict)
     recall_enabled: bool = False  # the agent has the context tools: its history may be compacted to stubs
+    request_cap: int | None = None  # this run's hard request limit (run_agent sets it; base.wind_down reads it)
     # shared with nested (agent-as-tool) runs
     retrieved: dict[str, RetrievedChunk] = field(default_factory=dict)
     via: dict[str, str] = field(default_factory=dict)
