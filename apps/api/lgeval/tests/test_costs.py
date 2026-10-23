@@ -104,7 +104,7 @@ def test_cost_and_estimates() -> None:
     usage = {"openai/gpt-4.1": TokenUsage(tokens_in=1_000_000, tokens_out=500_000)}
     assert cost_usd(usage, p) == pytest.approx(2.0 + 4.0)
     one = est_run_usd(p)
-    assert 0.008 < one < 0.014  # ~$0.011 per run: every role on deepseek-v4.1-flash via baidu/fp8
+    assert 0.025 < one < 0.04  # ~$0.03 per run: every role on deepseek-v4.1-flash via baidu/fp8
     assert estimate_runs_usd(10, p) == pytest.approx(10 * one)
 
 

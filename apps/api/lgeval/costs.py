@@ -36,10 +36,10 @@ FALLBACK_PRICING: dict[str, tuple[float, float]] = {
     "xiaomi/mimo-v2.6-pro": (0.387, 0.783),  # deepinfra/fp8 (list price 0.435 / 0.87)
 }
 
-# 8 real runs measured 72.3K/21.4K on the fast model + 27.7K/2.7K on the smart one; the study runs both roles
-# on deepseek-v4.1-flash (runners.configs.STUDY_MODELS), so the two are summed here
+# Measured on the study setup (every role on deepseek-v4.1-flash, multi-agent nodes; 2 complete smoke runs,
+# 2026-10-23): 270K/32K and 641K/66K tokens -> ~$0.02-0.05/run. Research nodes are ~55% of the input tokens.
 EST_RUN_USAGE: dict[str, TokenUsage] = {
-    "deepseek/deepseek-v4.1-flash": TokenUsage(tokens_in=100_000, tokens_out=24_100),
+    "deepseek/deepseek-v4.1-flash": TokenUsage(tokens_in=400_000, tokens_out=45_000),
 }
 
 # Rough cost of other systems/configs relative to one full run, for --dry-run estimates
