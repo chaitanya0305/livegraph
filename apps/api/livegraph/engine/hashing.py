@@ -37,9 +37,12 @@ def input_hash(
     title: str | None = None,
     question: str | None = None,
     ancestors: list[str] | None = None,
+    recipe: str | None = None,
 ) -> str:
     """``parent_version_ids`` are ``input_ref`` strings of the direct parents; ``ancestors`` the ``input_ref``s of
-    the transitive ancestors the node can read beyond them (research/claims evidence, context tools)."""
+    the transitive ancestors the node can read beyond them (research/claims evidence, context tools).
+    ``recipe`` is the node type's agent version (``agents.base.recipe``: prompts, limits, tools, model, knobs), so
+    shipping a new agent invalidates that node type's versions and nothing else."""
     payload: dict[str, Any] = {
         "type": node_type,
         "config": config or {},
@@ -55,6 +58,8 @@ def input_hash(
         payload["question"] = question
     if ancestors:
         payload["ancestors"] = sorted(set(ancestors))
+    if recipe is not None:
+        payload["recipe"] = recipe
     return _sha(payload)
 
 

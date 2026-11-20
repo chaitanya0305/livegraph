@@ -48,7 +48,7 @@ from livegraph import rag
 from livegraph.agents import SPECS, context
 from livegraph.agents import critic as critic_mod
 from livegraph.agents import research as research_mod
-from livegraph.agents.base import AgentContext, AgentLimits, ParentOutput
+from livegraph.agents.base import AgentContext, AgentLimits, ParentOutput, limits_of, recipe
 from livegraph.agents.deps import NodeDeps
 from livegraph.agents.guard import ToolOut
 from livegraph.agents.human_input import prompt_for
@@ -535,6 +535,12 @@ class RunScheduler:
             return input_ref(x.key, x.current_version_id, hashes.get(x.current_version_id))
 
         config = n.config or {}
+        spec = SPECS.get(n.type)
+        uses_tools = _uses_tools(n.type)
+        agent_version = None
+        if spec is not None:  # human_input has no model (TIER None): its recipe is just its (empty) agent shape
+            model = model_for(n.type, spec.TIER) if getattr(spec, "TIER", None) else None
+            agent_version = recipe(spec, model, uses_tools, {"context_tools": reads_ctx})
         return input_hash(
             node_type=n.type,
             config=config,
@@ -545,6 +551,7 @@ class RunScheduler:
             title=n.title,
             question=(config.get("question") or n.title) if n.type == "research" else None,
             ancestors=[ref(a) for a in extra],
+            recipe=agent_version,
         )
 
     async def _find_version_by_hash(self, s: AsyncSession, nid: UUID, h: str) -> NodeVersion | None:
@@ -641,9 +648,10 @@ class RunScheduler:
                 ctx = await self._context(s, g, n, run, steer_texts)
                 node_type, node_key = n.type, n.key
                 question = (n.config or {}).get("question") or n.title
+                node_config = dict(n.config or {})
 
         uses_tools = _uses_tools(node_type)
-        limits: AgentLimits | None = getattr(spec, "LIMITS", None)
+        limits: AgentLimits | None = limits_of(spec, node_config)
         reads_context = uses_tools and settings.context_tools and context_tools.has_context_tools(spec.agents)
         budgets = {**(context_tools.BUDGETS if reads_context else {}), **(limits.budgets if limits else {})}
         deps = NodeDeps(

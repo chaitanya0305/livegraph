@@ -8,9 +8,11 @@ compaction capability (``agents/history.py``). Running/streaming lives in ``agen
 
 from __future__ import annotations
 
+import hashlib
 import html
+import json
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from pydantic import BaseModel
@@ -145,6 +147,12 @@ def format_claims(claims: list[dict[str, Any]]) -> str:
 
 
 DeltaFn = Callable[[str], None]
+# a prompt: fixed text, or a function returning it (read when the agent runs, so it can follow settings)
+Text = str | Callable[[], str]
+
+
+def text_of(t: Text) -> str:
+    return t() if callable(t) else t
 
 
 @dataclass(frozen=True)
@@ -172,11 +180,11 @@ class AgentFactory:
         self,
         name: str,
         output: type[BaseModel],
-        system: str,
+        system: Text,
         *,
         tools: Sequence[Tool[Any]] = (),
         base_tools: Sequence[Tool[Any]] = (),
-        tool_system: str = "",
+        tool_system: Text = "",
         validator: Callable[..., Any] | None = None,
         retries: int = 2,
     ) -> None:
@@ -205,7 +213,7 @@ class AgentFactory:
                 out = PromptedOutput(self.output)
             elif mode == "submit":
                 out = ToolOutput(self.output, name="submit")
-            instructions = self.system + (self.tool_system if with_tools else "") + UNTRUSTED_NOTE
+            instructions = self._instructions_fn(with_tools)  # resolved per run: prompts may follow settings
             agent: Agent[Any, Any] = Agent(
                 output_type=out, instructions=[instructions, final_note], retries=self.retries, name=self.name,
                 tools=self.base_tools + (self.tools if with_tools else []), end_strategy="graceful",
@@ -218,3 +226,41 @@ class AgentFactory:
 
     def for_model(self, model: Model, with_tools: bool = True) -> Agent[Any, Any]:
         return self.get(self.mode_for(model, with_tools), with_tools)
+
+    def _instructions_fn(self, with_tools: bool) -> Callable[[], str]:
+        def instructions() -> str:  # no parameters: Pydantic AI then calls it without the run context
+            return self.instructions(with_tools)
+
+        return instructions
+
+    def instructions(self, with_tools: bool) -> str:
+        with_tools = with_tools and bool(self.tools)
+        return text_of(self.system) + (text_of(self.tool_system) if with_tools else "") + UNTRUSTED_NOTE
+
+
+# ------------------------------------------------------------------ agent version (``recipe``)
+
+
+def recipe(spec: Any, model: Model | None, uses_tools: bool, extra: dict[str, Any] | None = None) -> str:
+    """Short hash of everything that defines a node type's agent: its instructions (as this deployment resolves
+    them), limits, tool names, model and the settings it reads (``spec.recipe_settings()``). Part of the input
+    hash, so changing one agent invalidates that node type's versions only (downstream reruns only where the
+    new output differs, by early cutoff)."""
+    agents = getattr(spec, "agents", None)
+    limits = limits_of(spec, {})
+    payload = {
+        "instructions": agents.instructions(uses_tools) if agents is not None else "",
+        "tools": sorted(t.name for t in (agents.base_tools + agents.tools)) if agents is not None and uses_tools else [],
+        "limits": asdict(limits) if limits is not None else None,
+        "model": getattr(model, "model_name", None) or type(model).__name__ if model is not None else None,
+        "settings": spec.recipe_settings() if hasattr(spec, "recipe_settings") else {},
+        **(extra or {}),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def limits_of(spec: Any, config: dict[str, Any]) -> AgentLimits | None:
+    """A node's limits: ``spec.limits(config)`` when the type computes them (settings, priority), else ``LIMITS``."""
+    if hasattr(spec, "limits"):
+        return spec.limits(config or {})
+    return getattr(spec, "LIMITS", None)
