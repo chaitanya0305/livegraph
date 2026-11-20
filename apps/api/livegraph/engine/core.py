@@ -79,6 +79,14 @@ UPSTREAM_FORBIDDEN = ("plan", "human_input")  # request_upstream_work targets th
 IMPACT_ACTIONS = ("steer", "rerun", "config", "edit", "restore", "veto")
 
 
+def _follow_up_depth(n: Node) -> int:
+    """0 for planned research; a follow-up's depth (``params.depth``; older follow-ups without it are depth 1)."""
+    params = (n.config or {}).get("params") or {}
+    if not params.get("follow_up"):
+        return 0
+    return int(params.get("depth") or 1)
+
+
 def _uses_corpus(node_type: str) -> bool:
     return node_type == "research" or (node_type in CORPUS_TYPES and tools_enabled(node_type))
 
@@ -748,7 +756,11 @@ class RunScheduler:
                 self.force.discard(nid)
                 self.tasks.pop(nid, None)
                 await self.set_node_status(s, n, "done")
-                if node_type == "critic" and not uses_tools:  # single-shot fallback: follow-up from the output
+                # a `thin` verdict always gets its follow-up: single-shot critics have no tool, and tool-using
+                # critics often return `thin` without calling request_follow_up_research (16 of 17 in the Oct
+                # 2026 pilot). critic_follow_up is idempotent (an existing follow-up is kept) and enforces the
+                # depth and per-run limits.
+                if node_type == "critic":
                     out = critic_mod.CriticOutput.model_validate(output.model_dump())
                     if out.verdict == "thin" and (out.follow_up_question or "").strip():
                         await self.critic_follow_up(s, n, out.follow_up_question)
@@ -883,9 +895,12 @@ class RunScheduler:
     async def critic_follow_up(self, s: AsyncSession, critic: Node, question: str) -> ToolOut:
         """Add one follow-up research node (``{research_key}_fu``) and the edge critic -> follow-up.
 
-        Never chains (no follow-ups of follow-ups) and at most one per research node. The follow-up's edges
-        into claims are added by ``_attach_follow_ups`` once the critic's version persists, so a running or
-        finished claims node is never disturbed by a critic that is still thinking."""
+        At most one per research node. Follow-ups chain up to FOLLOW_UP_MAX_DEPTH (a planned research node is
+        depth 0; its follow-up depth 1, ...), and a run gets at most MAX_FOLLOW_UPS_PER_RUN; a follow-up below
+        the max depth gets its own critic (``c_{key}``, which claims waits for like every critic), so its gaps
+        can be followed up in turn. The follow-up's edges into claims are added by ``_attach_follow_ups`` once
+        the critic's version persists, so a running or finished claims node is never disturbed by a critic
+        that is still thinking."""
         q = (question or "").strip()
         if not q:
             return ToolOut(text="error: empty question", summary="empty question", ok=False, error="empty question")
@@ -894,21 +909,33 @@ class RunScheduler:
         if not sources:
             return ToolOut(text="error: no research to follow up", summary="no research input", ok=False,
                            error="no research input")
-        if any((p.config.get("params") or {}).get("follow_up") for p in sources):
-            return ToolOut(text="follow-ups of follow-up research are not allowed; return your verdict",
-                           summary="no chaining", ok=False, error="no chaining")
         src = sources[0]
+        depth = _follow_up_depth(src) + 1
+        if depth > settings.follow_up_max_depth:
+            return ToolOut(text=f"follow-up depth limit ({settings.follow_up_max_depth}) reached; return your verdict",
+                           summary="depth limit", ok=False, error="depth limit")
         key = f"{src.key}_fu"
         if key in g.by_key:
             return ToolOut(text=f"follow-up research {key} already exists; return your verdict",
                            summary=f"{key} already exists", node_ids=[str(g.by_key[key].id)])
+        n_follow_ups = sum(
+            1 for n in g.nodes.values() if n.type == "research" and not n.removed and _follow_up_depth(n) > 0
+        )
+        if n_follow_ups >= settings.max_follow_ups_per_run:
+            return ToolOut(text=f"this run already has {n_follow_ups} follow-ups (the limit); return your verdict",
+                           summary="follow-up limit", ok=False, error="follow-up limit")
         new = await self.add_node(
             s, key=key, type="research", title=f"Follow-up: {src.title}"[:120],
-            question=q, created_by="critic", params={"follow_up": True, "critic": critic.key},
+            question=q, created_by="critic", params={"follow_up": True, "critic": critic.key, "depth": depth},
         )
         await self.add_edge(s, critic.key, new.key)
+        ids = [str(new.id)]
+        if depth < settings.follow_up_max_depth and "critic" not in disabled_types():
+            c = await self.add_node(s, key=f"c_{new.key}", type="critic", title=f"Critique {new.key}", created_by="critic")
+            await self.add_edge(s, new.key, c.key)
+            ids.append(str(c.id))
         return ToolOut(text=f"added follow-up research node {new.key}; it runs before the claims. Return your verdict.",
-                       summary=f"+ research {new.key}", node_ids=[str(new.id)])
+                       summary=f"+ research {new.key}", node_ids=ids)
 
     async def _attach_follow_ups(self, s: AsyncSession, critic: Node) -> None:
         g = await load_graph(s, self.run_id)

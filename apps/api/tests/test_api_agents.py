@@ -230,13 +230,18 @@ async def test_critic_tool_adds_follow_up_without_cancelling_claims(client, fake
     nodes = by_key(snap)
     fu, claims = nodes["r1_fu"], nodes["claims"]
     step = next(s for s in snap["versions"][nodes["c1"]["id"]]["trace"] if s["tool"] == "request_follow_up_research")
-    assert step["ok"] and step["node_ids"] == [fu["id"]]
+    # below FOLLOW_UP_MAX_DEPTH (2) the follow-up gets its own critic, wired follow-up -> critic
+    fu_critic = nodes["c_r1_fu"]
+    assert step["ok"] and step["node_ids"] == [fu["id"], fu_critic["id"]]
+    assert fu["config"]["params"]["depth"] == 1 and fu_critic["type"] == "critic"
+    assert any(e["source_node_id"] == fu["id"] and e["target_node_id"] == fu_critic["id"] for e in snap["edges"])
     evs = await events(client, run_id)
     claims_status = [e["payload"]["status"] for e in _node_events(evs, claims["id"], "node.status")]
     assert claims_status == ["running", "done"]  # never started early, never cancelled
-    fu_done = max(e["seq"] for e in _node_events(evs, fu["id"], "node.status") if e["payload"]["status"] == "done")
     claims_run = next(e["seq"] for e in _node_events(evs, claims["id"], "node.status"))
-    assert claims_run > fu_done
+    for n in (fu, fu_critic):  # claims waits for the follow-up and for its critic
+        done = max(e["seq"] for e in _node_events(evs, n["id"], "node.status") if e["payload"]["status"] == "done")
+        assert claims_run > done
     assert len(await versions(client, claims["id"])) == 1
     assert_fold_matches(snap, evs)
 

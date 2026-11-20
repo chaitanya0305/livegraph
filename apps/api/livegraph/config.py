@@ -59,6 +59,10 @@ class Settings(BaseSettings):
     research_web_max: int = 4  # web_search budget per research node in the loop (before scaling)
     # multiplies every research budget and request limit (evaluation sweep of search depth); priority scales on top
     research_budget_scale: float = 1.0
+    # Critic follow-ups: depth 1 = follow-ups cannot be followed up (the previous rule); 2 = one more level,
+    # each follow-up below the max depth getting its own critic. At most max_follow_ups_per_run in a run.
+    follow_up_max_depth: int = 2
+    max_follow_ups_per_run: int = 4
     fetch_page: bool = False  # enable the fetch_page tool (research, planner)
     fetch_max_bytes: int = 400_000
     fetch_timeout: float = 10.0
