@@ -1029,7 +1029,7 @@ class RunScheduler:
 
     async def tool_add_node(
         self, deps: NodeDeps, *, key: str, type: str, title: str, question: str | None = None,
-        instructions: str | None = None,
+        instructions: str | None = None, priority: str | None = None,
     ) -> ToolOut:
         if type == "plan":
             return ToolOut(text="error: the plan node already exists", summary="rejected", ok=False,
@@ -1042,7 +1042,10 @@ class RunScheduler:
                     n = g.by_key[_slug(key)]
                     return ToolOut(text=f"node {n.key} already exists", summary=f"{n.key} exists", node_ids=[str(n.id)])
                 try:
-                    n = await self.add_node(s, key=key, type=type, title=title, question=question, instructions=instructions)
+                    params = {"priority": priority} if type == "research" and priority in ("high", "low") else None
+                    n = await self.add_node(
+                        s, key=key, type=type, title=title, question=question, instructions=instructions, params=params
+                    )
                 except EngineError as e:
                     return ToolOut(text=f"error: {e}", summary=str(e), ok=False, error=str(e))
         return ToolOut(text=f"added node {n.key}", summary=f"+ {n.type} {n.key}", node_ids=[str(n.id)])
@@ -1134,7 +1137,7 @@ class RunScheduler:
             run = await s.get(Run, self.run_id)
             if qs == [plan.title]:
                 qs = [run.goal]
-            for i, q in enumerate(qs[:5], 1):
+            for i, q in enumerate(qs[: max(3, settings.plan_max_research)], 1):
                 await self.add_node(s, key=unique(f"r{i}"), type="research", title=q[:80], question=q)
                 g = await refresh()
             research = of_type("research")

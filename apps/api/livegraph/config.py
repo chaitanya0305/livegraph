@@ -63,6 +63,9 @@ class Settings(BaseSettings):
     # each follow-up below the max depth getting its own critic. At most max_follow_ups_per_run in a run.
     follow_up_max_depth: int = 2
     max_follow_ups_per_run: int = 4
+    # the planner may scout the topic with web_search before choosing its research nodes
+    plan_web_search: bool = True
+    plan_max_research: int = 7  # research nodes the planner may add (3..this)
     fetch_page: bool = False  # enable the fetch_page tool (research, planner)
     fetch_max_bytes: int = 400_000
     fetch_timeout: float = 10.0
