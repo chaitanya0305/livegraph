@@ -8,7 +8,9 @@ from livegraph.agents.base import (
     AgentContext,
     AgentLimits,
     format_claims,
+    evidence_settings,
     format_evidence,
+    format_research_evidence,
     format_instructions,
     format_steer,
 )
@@ -30,7 +32,7 @@ LIMITS = AgentLimits(request_limit=10, timeout=300, budgets={"web_search": 1, "s
 def build_debate_prompt(ctx: AgentContext) -> str:
     return (
         f"## Goal\n{ctx.goal}\n\n## Claims\n{format_claims(ctx.claims)}\n\n## Evidence chunks\n"
-        f"{format_evidence(ctx.evidence)}{format_instructions(ctx)}{format_steer(ctx)}"
+        f"{format_research_evidence(ctx.evidence)}{format_instructions(ctx)}{format_steer(ctx)}"
     )
 
 

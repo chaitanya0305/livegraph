@@ -12,7 +12,8 @@ from livegraph.agents.base import (
     AgentFactory,
     AgentLimits,
     cite,
-    format_evidence,
+    evidence_settings,
+    format_research_evidence,
     format_instructions,
     format_steer,
 )
@@ -41,6 +42,10 @@ Prefer 4-8 claims. Merge duplicates; drop findings with no support."""
 
 LIMITS = AgentLimits(request_limit=3, timeout=180)
 
+
+def recipe_settings() -> dict:
+    return evidence_settings()
+
 # context tools only run with CONTEXT_TOOLS_SINGLE_SHOT=true (otherwise this stays a validated single shot)
 agents = AgentFactory(
     "claims", ClaimsOutput, SYSTEM, tools=context_tools.TOOLS, validator=validators.claims
@@ -52,7 +57,7 @@ def build_prompt(ctx: AgentContext) -> str:
     research = "\n\n".join(f"### {p.title} ({p.key})\n{p.output_text}" for p in ctx.parents) or "(none)"
     return (
         f"## Goal\n{ctx.goal}\n\n## Research results\n{research}\n\n## Evidence chunks\n"
-        f"{format_evidence(ctx.evidence)}{format_instructions(ctx)}{format_steer(ctx)}"
+        f"{format_research_evidence(ctx.evidence)}{format_instructions(ctx)}{format_steer(ctx)}"
     )
 
 

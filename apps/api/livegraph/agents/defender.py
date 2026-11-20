@@ -5,7 +5,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from livegraph.agents import debate, validators
-from livegraph.agents.base import AgentContext, AgentFactory, cite
+from livegraph.agents.base import AgentContext, AgentFactory, cite, evidence_settings
 from livegraph.agents.debate import build_debate_prompt
 
 TYPE = "defender"
@@ -30,6 +30,10 @@ Never invent chunk ids. If a claim is genuinely indefensible, say so plainly. On
 referencing it by `claim_key` (C1, C2, ...)."""
 
 LIMITS = debate.LIMITS
+
+
+def recipe_settings() -> dict:
+    return evidence_settings()
 
 agents = AgentFactory(
     "defender", DefenderOutput, SYSTEM, tool_system=debate.TOOL_SYSTEM, tools=debate.TOOLS,

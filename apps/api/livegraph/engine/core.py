@@ -464,10 +464,9 @@ class RunScheduler:
         cache[key] = value
 
     async def _ancestor_evidence(self, s: AsyncSession, g: Graph, n: Node) -> list[dict[str, Any]]:
-        vids = [
-            a.current_version_id for a in g.ancestors(n.id)
-            if a.type == "research" and not Graph.inactive(a) and a.current_version_id
-        ]
+        research = [a for a in g.ancestors(n.id) if a.type == "research" and not Graph.inactive(a) and a.current_version_id]
+        vids = [a.current_version_id for a in research]
+        key_of = {a.current_version_id: a.key for a in research}
         key = frozenset(vids)
         if key in self._evidence_cache:  # versions are immutable; trust changes clear the cache
             return list(self._evidence_cache[key])
@@ -476,6 +475,7 @@ class RunScheduler:
         for vid in vids:
             for r in rows.get(vid, []):
                 cid = str(r["chunk_id"])
+                r = {**r, "research": key_of[vid]}  # which research node found it (round-robin in prompts)
                 if cid not in seen:
                     seen[cid] = r
                 elif r["score"] > seen[cid]["score"] or r.get("cited"):

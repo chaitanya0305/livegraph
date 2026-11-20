@@ -131,6 +131,40 @@ def format_evidence(chunks: list[dict[str, Any]], limit: int = 24, max_chars: in
     return "\n\n".join(wrap_untrusted(c, max_chars) for c in chunks[:limit])
 
 
+def select_evidence(chunks: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """Up to ``limit`` chunks for a prompt: every research node's cited chunks first, taken round-robin across
+    nodes (best score first within a node) so no node crowds out the others, then the uncited rest by score.
+    ``research`` on a chunk names the research node it came from (engine ``_ancestor_evidence``)."""
+    cited: dict[str, list[dict[str, Any]]] = {}
+    rest: list[dict[str, Any]] = []
+    for c in chunks:
+        if c.get("cited"):
+            cited.setdefault(str(c.get("research") or ""), []).append(c)
+        else:
+            rest.append(c)
+    out: list[dict[str, Any]] = []
+    queues = [sorted(q, key=lambda c: -float(c.get("score") or 0)) for q in cited.values()]
+    i = 0
+    while len(out) < limit and any(queues):
+        q = queues[i % len(queues)]
+        if q:
+            out.append(q.pop(0))
+        i += 1
+    rest.sort(key=lambda c: -float(c.get("score") or 0))
+    return out + rest[: max(0, limit - len(out))]
+
+
+def format_research_evidence(chunks: list[dict[str, Any]]) -> str:
+    """The research evidence block of the claims and debate prompts (EVIDENCE_PROMPT_CHUNKS / _CHARS)."""
+    picked = select_evidence(chunks, settings.evidence_prompt_chunks)
+    return format_evidence(picked, limit=len(picked) or 1, max_chars=settings.evidence_prompt_chars)
+
+
+def evidence_settings() -> dict[str, int]:
+    """Part of the recipe of every node type whose prompt uses ``format_research_evidence``."""
+    return {"evidence_chunks": settings.evidence_prompt_chunks, "evidence_chars": settings.evidence_prompt_chars}
+
+
 def format_steer(ctx: AgentContext) -> str:
     if not ctx.steer_texts:
         return ""

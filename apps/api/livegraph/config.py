@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     # Ablation knob (evaluation): node types never added to a graph (comma-separated, from DISABLABLE_TYPES);
     # the default shape is rewired around them (e.g. claims -> editor without the debate). Empty = off.
     disabled_node_types: str = ""
+    # How much research evidence the claims writer and the debaters see in their prompt: cited chunks first,
+    # taken round-robin across research nodes, then uncited ones (pre-Nov 2026: the first 24 chunks, 900 chars)
+    evidence_prompt_chunks: int = 100
+    evidence_prompt_chars: int = 600
     research_seed_k: int = 4  # chunks the engine retrieves up front as a research agent's starting evidence
     search_k_max: int = 8  # cap on `k` for the search_documents tool
     # soft cap on web_search calls per research node (RESEARCH_LOOP=false; the loop uses research_web_max)
