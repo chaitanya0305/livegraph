@@ -29,6 +29,15 @@ BASE: dict[str, str] = {
     "DISABLED_NODE_TYPES": "",
     "AGENT_TOOLS": DEFAULT_AGENT_TOOLS,
     "CONTEXT_TOOLS": "true",
+    # search depth (livegraph/config.py): the research loop, full web pages, chained follow-ups, planner scouting
+    "RESEARCH_LOOP": "true",
+    "WEB_PAGE_TEXT": "true",
+    "FOLLOW_UP_MAX_DEPTH": "2",
+    "PLAN_WEB_SEARCH": "true",
+    "RESEARCH_BUDGET_SCALE": "1.0",
+    "REASONING_NODES": "prosecutor,defender",
+    "EVIDENCE_PROMPT_CHUNKS": "100",
+    "EVIDENCE_PROMPT_CHARS": "600",
 }
 
 
@@ -61,6 +70,27 @@ CONFIGS: dict[str, SystemConfig] = {
             "single_shot",
             "agent tool loops: every node is one LLM call (research gets engine-side search; planner keeps graph tools)",
             {"AGENT_TOOLS": ""},
+        ),
+        SystemConfig(
+            "old_search",
+            "the search-depth changes: single-pass research on highlight snippets, unchained follow-ups, no planner "
+            "scouting (the pre-loop agent)",
+            {"RESEARCH_LOOP": "false", "WEB_PAGE_TEXT": "false", "FOLLOW_UP_MAX_DEPTH": "1", "PLAN_WEB_SEARCH": "false"},
+        ),
+        SystemConfig(
+            "research_reasoning",
+            "nothing removed: research agents also get the model's hidden reasoning (vs. reflect alone)",
+            {"REASONING_NODES": "prosecutor,defender,research"},
+        ),
+        SystemConfig(
+            "budget_x0.5",
+            "half the research search budget and request cap (search-depth sweep)",
+            {"RESEARCH_BUDGET_SCALE": "0.5"},
+        ),
+        SystemConfig(
+            "budget_x2",
+            "nothing removed: twice the research search budget and request cap (search-depth sweep)",
+            {"RESEARCH_BUDGET_SCALE": "2.0"},
         ),
         SystemConfig(
             "no_context_tools",
