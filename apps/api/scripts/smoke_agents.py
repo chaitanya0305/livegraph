@@ -49,7 +49,7 @@ async def main(question: str) -> int:
     ctx = AgentContext(goal=question, node_key="r1", node_type="research", title=question,
                        config={"question": question}, evidence=[c.model_dump(mode="json") for c in seeds])
     deps = PrintDeps(run_id=run_id, node_id=uuid.uuid4(), node_key="r1", node_type="research", sched=None,
-                     attempt_id=uuid.uuid4().hex, me=None, ctx=ctx, budgets=dict(research.LIMITS.budgets))
+                     attempt_id=uuid.uuid4().hex, me=None, ctx=ctx, budgets=dict(research.limits({}).budgets))
     deps.add_chunks(seeds, "seed")
     model = model_for("research", research.TIER)
     agent = research.agents.for_model(model, with_tools=True)
@@ -63,9 +63,9 @@ async def main(question: str) -> int:
 
     t0 = time.monotonic()
     result = await run_agent(
-        agent, research.build_prompt(ctx) + format_budgets(research.LIMITS), model=model, render=research.render,
-        deps=deps, on_reset=on_reset, limits=UsageLimits(request_limit=research.LIMITS.request_limit),
-        timeout=research.LIMITS.scaled_timeout,
+        agent, research.build_prompt(ctx) + format_budgets(research.limits({})), model=model, render=research.render,
+        deps=deps, on_reset=on_reset, limits=UsageLimits(request_limit=research.limits({}).request_limit),
+        timeout=research.limits({}).scaled_timeout,
     )
     cited = research.cited_ids(result.output)
     unknown = [c for c in cited if not deps.citable(c)]

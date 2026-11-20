@@ -51,6 +51,14 @@ class Settings(BaseSettings):
     # highlight snippets, so agents search and read whole pages. false = highlights only (pre-loop behaviour).
     web_page_text: bool = True
     web_page_chars: int = 12_000
+    # Research loop: research agents work in rounds (explore -> reflect -> target gaps + challenge -> reflect)
+    # and stop when a round adds little; false = the previous single-pass prompt, budgets and tools.
+    research_loop: bool = True
+    research_max_rounds: int = 3  # reflect calls before the search tools are withdrawn
+    research_min_new_docs: int = 2  # from round 2 on, a round adding fewer new documents ends the search
+    research_web_max: int = 4  # web_search budget per research node in the loop (before scaling)
+    # multiplies every research budget and request limit (evaluation sweep of search depth); priority scales on top
+    research_budget_scale: float = 1.0
     fetch_page: bool = False  # enable the fetch_page tool (research, planner)
     fetch_max_bytes: int = 400_000
     fetch_timeout: float = 10.0

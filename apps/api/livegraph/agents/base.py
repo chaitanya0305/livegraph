@@ -34,10 +34,19 @@ SOURCE_MAX_CHARS = 1200
 FINAL_REQUESTS = 2
 
 
+# tools a research agent loses once its stop rule fires (``deps.search_stopped``, set by the ``reflect`` tool)
+SEARCH_TOOLS = frozenset({"web_search", "search_documents", "fetch_page"})
+
+
 async def wind_down(ctx: Any, tool_defs: list[Any]) -> list[Any]:
     """PrepareTools capability: hide the function tools for the last FINAL_REQUESTS requests under ``deps.request_cap``
-    (set by ``run_agent`` from its UsageLimits); output tools are not affected."""
-    return [] if _winding_down(ctx) else tool_defs
+    (set by ``run_agent`` from its UsageLimits), and the search tools once ``deps.search_stopped``; output tools
+    are not affected."""
+    if _winding_down(ctx):
+        return []
+    if getattr(ctx.deps, "search_stopped", False):
+        return [t for t in tool_defs if t.name not in SEARCH_TOOLS]
+    return tool_defs
 
 
 def _winding_down(ctx: Any) -> bool:

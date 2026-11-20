@@ -138,6 +138,7 @@ export type ToolName =
   | "search_documents"
   | "web_search"
   | "read_source"
+  | "reflect"
   | "fetch_page"
   | "request_follow_up_research"
   | "ask_rebuttal"

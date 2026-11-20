@@ -188,7 +188,9 @@ async def test_store_rows_backfill_compaction_and_recall_in_agent_loop(client, f
     assert_fold_matches(snap, evs)
 
 
-async def test_budget_exhausted_not_stored_and_cached_repeat_reuses_ref(client, fake):
+async def test_budget_exhausted_not_stored_and_cached_repeat_reuses_ref(client, fake, monkeypatch):
+    monkeypatch.setattr(settings, "research_web_max", 2)  # the 3rd web_search is past the budget
+
     def script(text: str, rnd: int):
         if rnd < 3:
             return [("web_search", {"query": f"angle {rnd}"})]
