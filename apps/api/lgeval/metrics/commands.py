@@ -18,10 +18,11 @@ from lgeval.schema import ClaimLabel, PairwiseRecord, Question, RunRecord, Score
 
 log = logging.getLogger("lgeval.metrics")
 
-ALL_METRICS = ("factual", "citation", "accuracy", "calibration")
+ALL_METRICS = ("factual", "citation", "accuracy", "calibration", "search")
+LLM_FREE = {"search"}  # computed from the run snapshot: no judge, recorded with judge_model None
 # metric group -> the ScoreRecord.metric whose presence marks the group done for a run (resume)
 DONE_METRIC = {"factual": "factual_precision", "citation": "citation_recall", "accuracy": "answer_accuracy",
-               "calibration": "brier"}
+               "calibration": "brier", "search": "search_tool_calls"}
 SCORABLE = {"done", "partial", "imported"}  # partial: a side node failed, the brief is complete
 
 
@@ -116,6 +117,8 @@ def estimate(run: RunRecord, question: Question | None, metric: str) -> tuple[in
         return calls, calls * (450 + 14 * 300 + 10 * 40), len(run.claims) * 40
     if metric == "pairwise":
         return 2, 2 * (400 + 2 * brief_t), 2 * 150
+    if metric in LLM_FREE:
+        return 0, 0, 0
     raise ValueError(metric)
 
 
@@ -137,9 +140,9 @@ def print_estimate(rows: dict[str, list[int]], model: str, n_runs: int) -> float
 
 async def score_run(
     run: RunRecord, question: Question | None, metrics: list[str], llm: LLM, *, judge_model: str,
-    fetcher: PageFetcher | None,
+    fetcher: PageFetcher | None, results_dir: Path | None = None,
 ) -> tuple[list[ScoreRecord], list[ClaimLabel]]:
-    from lgeval.metrics import accuracy, calibration, citation, factual
+    from lgeval.metrics import accuracy, calibration, citation, factual, search
 
     scores: list[ScoreRecord] = []
     labels: list[ClaimLabel] = []
@@ -157,6 +160,8 @@ async def score_run(
             run_labels = await calibration.label_claims(run, question, llm, model=judge_model)
             labels += run_labels
             scores += calibration.calibration_scores(run_labels, run, judge_model=judge_model)
+        elif m == "search" and results_dir is not None:
+            scores += search.score_search(run, results_dir)
     return scores, labels
 
 
@@ -207,7 +212,8 @@ async def cmd_score(args: argparse.Namespace) -> int:
             if rd != d:
                 continue
             need = [m for m in metrics
-                    if (run.question_id, run.system, run.repeat, DONE_METRIC[m], model) not in done]
+                    if (run.question_id, run.system, run.repeat, DONE_METRIC[m],
+                        None if m in LLM_FREE else model) not in done]
             if need:
                 todo.append((d, run, need))
 
@@ -238,7 +244,7 @@ async def cmd_score(args: argparse.Namespace) -> int:
             for m in need:  # written per metric, so a budget stop keeps finished metrics
                 try:
                     scores, labels = await score_run(run, questions.get(run.question_id), [m], llm,
-                                                     judge_model=model, fetcher=fetcher)
+                                                     judge_model=model, fetcher=fetcher, results_dir=d)
                 except BudgetExhausted:
                     stopped = True
                     return

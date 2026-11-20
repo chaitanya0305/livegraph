@@ -586,3 +586,63 @@ def test_register_adds_subcommands():
     assert a.dry_run and a.fetch_urls and a.judge_model == "xiaomi/mimo-v2.6-pro"
     b = parser.parse_args(["pairwise", "--results", "x", "--a", "full", "--b", "no_debate"])
     assert b.a == "full" and b.func is commands.cmd_pairwise
+
+
+# --- search behaviour (from snapshots, no judge) ---------------------------------------------------------------
+
+
+def _search_snapshot() -> dict:
+    def step(tool, summary="3 chunks", args="q", parent=None):
+        return {"tool": tool, "summary": summary, "args_summary": args, "parent_call_id": parent}
+
+    def ret(url, cited):
+        return {"chunk_id": url + str(cited), "source_url": url, "cited": cited}
+
+    planned = {
+        "id": "v1", "output": {"search_stats": {"stopped_by": "rule", "queries": {"explore": 1, "challenge": 1}}},
+        "trace": [step("web_search"), step("reflect"), step("web_search", args="query=x, kind=challenge"),
+                  step("reflect"), step("read_source"), step("ask_rebuttal", parent="nested")],
+        "retrievals": [ret("https://www.a.org/1", True), ret("https://b.org/2", True), ret("https://a.org/3", False),
+                       ret("https://c.org/4", False)],
+    }
+    follow_up = {
+        "id": "v2", "output": {"findings": []},
+        "trace": [step("web_search"), step("web_search"), step("web_search", summary="budget exhausted")],
+        "retrievals": [ret("https://d.org/1", True), ret("https://d.org/2", False)],
+    }
+    return {
+        "nodes": [
+            {"id": "n1", "type": "research", "current_version_id": "v1", "config": {"params": {}}},
+            {"id": "n2", "type": "research", "current_version_id": "v2",
+             "config": {"params": {"follow_up": True, "depth": 2}}},
+            {"id": "n9", "type": "research", "current_version_id": "v9", "removed": True, "config": {}},
+            {"id": "n3", "type": "claims", "current_version_id": "v3", "config": {}},
+        ],
+        # GET /runs/{id} shape: node id -> that node's current version
+        "versions": {"n1": planned, "n2": follow_up, "n9": {"id": "v9", "trace": [step("web_search")]},
+                     "n3": {"id": "v3", "trace": [], "retrievals": []}},
+    }
+
+
+def test_search_metrics_from_snapshot(tmp_path):
+    import json
+
+    from lgeval.metrics import search
+    from lgeval.schema import RunRecord
+
+    m = search.run_metrics(_search_snapshot())
+    assert m["search_tool_calls"] == (4.0, 2)  # 5 top-level + 3, nested call ignored
+    assert m["search_budget_exhausted"] == (0.5, 2) and m["search_rule_stop"] == (0.5, 2)
+    assert m["search_rounds"] == (1.0, 2) and m["search_challenge"] == (0.5, 2)
+    assert m["search_domains_cited"] == (1.5, 2)  # a.org + b.org, d.org
+    assert m["search_cited_share"] == (0.5, 6)
+    assert m["search_follow_ups"] == (1.0, 2) and m["search_follow_up_depth"] == (2.0, 2)
+    assert search.run_metrics({"nodes": [], "versions": {}}) is None
+
+    (tmp_path / "snapshots").mkdir()
+    (tmp_path / "snapshots" / "r.json").write_text(json.dumps(_search_snapshot()))
+    run = RunRecord(question_id="q1", dataset="custom", system="full", run_id="r", status="done",
+                    snapshot_path="snapshots/r.json")
+    recs = search.score_search(run, tmp_path)
+    assert {r.metric for r in recs} == set(search.METRICS) and all(r.judge_model is None for r in recs)
+    assert search.score_search(run.model_copy(update={"snapshot_path": None}), tmp_path) == []

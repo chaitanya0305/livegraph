@@ -32,8 +32,20 @@ METRIC_LABELS = {
     "cost_usd": "Cost ($)",
     "wall_s": "Wall (s)",
 }
+# search behaviour (lgeval/metrics/search.py): label and decimals
+SEARCH_METRICS = {
+    "search_tool_calls": ("Tool calls/node", 1),
+    "search_budget_exhausted": ("Budget hit", 2),
+    "search_rule_stop": ("Stopped by rule", 2),
+    "search_rounds": ("Rounds", 1),
+    "search_challenge": ("Challenge search", 2),
+    "search_domains_cited": ("Sites cited/node", 1),
+    "search_cited_share": ("Cited share", 2),
+    "search_follow_ups": ("Follow-ups", 1),
+}
 MUTATION_ORDER = ["identical", "distrust", "steer", "edit", "patch_question"]
-SYSTEM_ORDER = ["full", "no_debate", "no_critic", "single_shot", "no_context_tools", "single_agent"]
+SYSTEM_ORDER = ["full", "old_search", "research_reasoning", "budget_x0.5", "budget_x2", "no_debate", "no_critic",
+                "single_shot", "no_context_tools", "single_agent"]
 OK_STATUSES = {"done", "partial", "imported"}
 REFERENCE = "full"
 N_BOOT = 2000
@@ -271,6 +283,21 @@ def compute_quality(res: Results) -> dict[str, dict[str, dict[str, Any]]]:
     return out
 
 
+def compute_search(res: Results) -> dict[str, dict[str, dict[str, Any]]]:
+    """Per system: each search metric's mean over questions (repeats averaged first) with a bootstrap CI."""
+    scores = [s for s in res.scores if s.metric in SEARCH_METRICS]
+    out: dict[str, dict[str, dict[str, Any]]] = {}
+    for sys in _sort_systems({s.system for s in scores}):
+        row = {}
+        for m in SEARCH_METRICS:
+            vals = per_question((s.question_id, s.value) for s in scores if s.system == sys and s.metric == m)
+            if vals:
+                row[m] = stat(vals)
+        if row:
+            out[sys] = row
+    return out
+
+
 def compute_pairwise(res: Results, reference: str = REFERENCE) -> dict[str, dict[str, Any]]:
     """Reference system's win rate against each opponent; ties count half. Wilson 95% CI."""
     tally: dict[str, dict[str, int]] = defaultdict(lambda: {"win": 0, "tie": 0, "loss": 0})
@@ -415,6 +442,7 @@ def summarize(res: Results) -> dict[str, Any]:
         "calibration": compute_calibration(res),
         "recompute": compute_recompute(res),
         "study_cost": compute_study_cost(res),
+        "search": compute_search(res),
     }
 
 
@@ -607,6 +635,28 @@ def study_cost_table(s: dict[str, Any]) -> Table | None:
         ["Item", "Count", r"USD", "Wall (h)"],
         tex_rows,
         note=note,
+    )
+
+
+def search_table(q: dict[str, dict[str, dict[str, Any]]]) -> Table | None:
+    if not q:
+        return None
+    cols = [m for m in SEARCH_METRICS if any(m in row for row in q.values())]
+    rows, tex_rows = [], []
+    for sys, row in q.items():
+        rows.append([f"`{sys}`"] + [fci(row.get(m), SEARCH_METRICS[m][1]) for m in cols])
+        tex_rows.append([tex(sys)] + [fci(row.get(m), SEARCH_METRICS[m][1], latex=True) for m in cols])
+    return Table(
+        "search",
+        "Table 6. Search behaviour of the research agents",
+        "Search behaviour of the research nodes by system: mean over questions with 95\\% bootstrap CI.",
+        ["System", *[SEARCH_METRICS[m][0] for m in cols]],
+        rows,
+        ["System", *[tex(SEARCH_METRICS[m][0]) for m in cols]],
+        tex_rows,
+        note="From run snapshots (no judge). Shares are per research node except cited share (cited / retrieved "
+             "chunks); follow-ups per run. Mean over questions, 95% bootstrap CI in brackets.",
+        wide=True,
     )
 
 
@@ -810,12 +860,14 @@ def _jsonable(x: Any) -> Any:
     return x
 
 
+OPTIONAL_TABLES = {"search"}
 TEX_LABELS = {
     "quality": ("tab:quality", "Quality by system."),
     "pairwise": ("tab:pairwise", f"Pairwise preference of {REFERENCE}."),
     "calibration": ("tab:calibration", "Calibration of judge confidence."),
     "recompute": ("tab:recompute", "Incremental recompute cost."),
     "study_cost": ("tab:study_cost", "Cost of the study."),
+    "search": ("tab:search", "Search behaviour of the research agents."),
 }
 
 
@@ -828,6 +880,7 @@ def build_report(res: Results, out: Path) -> dict[str, Any]:
         ("calibration", "Table 3. Calibration (Claim B)", calibration_table(summary["calibration"])),
         ("recompute", "Table 4. Incremental recompute (Claim C)", recompute_table(summary["recompute"])),
         ("study_cost", "Table 5. Cost of the study", study_cost_table(summary["study_cost"])),
+        ("search", "Table 6. Search behaviour of the research agents", search_table(summary["search"])),
     ]
     figures = {
         "quality.svg": quality_svg(summary["quality"]),
@@ -840,6 +893,7 @@ def build_report(res: Results, out: Path) -> dict[str, Any]:
         "calibration": "no `claim_labels.jsonl` records and no brier/ece scores",
         "recompute": "no `recompute.jsonl` records",
         "study_cost": "no records with measured cost",
+        "search": "no search scores (`lgeval score --metrics search`)",
     }
     (out / "tables").mkdir(parents=True, exist_ok=True)
     (out / "figures").mkdir(parents=True, exist_ok=True)
@@ -861,6 +915,8 @@ def build_report(res: Results, out: Path) -> dict[str, Any]:
     notes: list[str] = []
     for key, title, t in tables:
         label, caption = TEX_LABELS[key]
+        if t is None and key in OPTIONAL_TABLES:  # diagnostics: shown only when there is data
+            continue
         md.append(f"## {title}")
         md.append("")
         if t is None:
