@@ -45,7 +45,12 @@ class Settings(BaseSettings):
     disabled_node_types: str = ""
     research_seed_k: int = 4  # chunks the engine retrieves up front as a research agent's starting evidence
     search_k_max: int = 8  # cap on `k` for the search_documents tool
-    web_search_max_per_node: int = 2  # soft cap on web_search calls per research node
+    # soft cap on web_search calls per research node (RESEARCH_LOOP=false; the loop uses research_web_max)
+    web_search_max_per_node: int = 2
+    # Web pages: ingest each result's page text (Exa `contents.text`, up to web_page_chars) instead of only its
+    # highlight snippets, so agents search and read whole pages. false = highlights only (pre-loop behaviour).
+    web_page_text: bool = True
+    web_page_chars: int = 12_000
     fetch_page: bool = False  # enable the fetch_page tool (research, planner)
     fetch_max_bytes: int = 400_000
     fetch_timeout: float = 10.0

@@ -57,6 +57,16 @@ class NodeDeps:
     # history compaction (agents/history.py): tool return (context.part_key) -> ref, and ref -> stub line
     refs: dict[str, str] = field(default_factory=dict)
     stubs: dict[str, str] = field(default_factory=dict)
+    # research rounds (agents/tools/research_tools.py): web_search kinds used, the reflect log (one entry per
+    # round: open gaps, new documents), the documents seen at the last reflect, and the stop flag that withdraws
+    # the search tools (base.wind_down)
+    query_kinds: dict[str, int] = field(default_factory=dict)
+    rounds: list[dict[str, Any]] = field(default_factory=list)
+    docs_at_reflect: set[str] = field(default_factory=set)
+    search_stopped: bool = False
+
+    def doc_ids_seen(self) -> set[str]:
+        return {str(c.document_id) for c in self.retrieved.values()}
 
     def __post_init__(self) -> None:
         self.agent = self.agent or self.node_type

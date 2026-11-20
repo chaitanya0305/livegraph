@@ -1,9 +1,11 @@
 """Web research: Exa's search API or OpenRouter's web search plugin (``WEB_PROVIDER``).
 
 Exa: ``POST {EXA_BASE_URL}/search`` with header ``x-api-key`` and body
-``{"query", "type": "auto", "numResults": N, "contents": {"highlights": true}}``. Response:
-``results: [{url, title, highlights: [str], publishedDate?, author?}]``; the highlights (query-relevant
-page excerpts) become the citation content. No LLM call is involved.
+``{"query", "type": "auto", "numResults": N, "contents": {"highlights": true, "text": {"maxCharacters": C}}}``
+(``text`` only with WEB_PAGE_TEXT; optional ``startPublishedDate`` and ``category`` filters). Response:
+``results: [{url, title, text?, highlights: [str], publishedDate?, author?}]``; the page text (else the
+highlights, query-relevant excerpts) becomes the citation content, so a whole page is chunked and searchable.
+No LLM call is involved.
 
 OpenRouter request: chat.completions with ``extra_body={"plugins": [{"id": "web", "max_results": N}]}``
 (equivalent to the ``:online`` model suffix). Response: the assistant message carries
@@ -119,7 +121,8 @@ def _web_body(max_results: int) -> dict:
 def parse_exa_results(data: Any) -> list[dict]:
     """``[{url, title, content}]`` from an Exa /search response, in order, deduped by url.
 
-    Content is the result's highlights joined by blank lines (falling back to ``text`` if present).
+    Content is the page ``text`` when Exa returned one that is longer than the highlights (WEB_PAGE_TEXT),
+    else the highlights joined by blank lines.
     """
     seen: set[str] = set()
     out: list[dict] = []
@@ -130,13 +133,27 @@ def parse_exa_results(data: Any) -> list[dict]:
             continue
         seen.add(url)
         highlights = [h.strip() for h in r.get("highlights") or [] if isinstance(h, str) and h.strip()]
-        content = "\n\n".join(highlights) or (r.get("text") or "").strip()
+        joined = "\n\n".join(highlights)
+        text = (r.get("text") or "").strip() if isinstance(r.get("text"), str) else ""
+        content = text if len(text) > len(joined) else joined
         out.append({"url": url, "title": (r.get("title") or url).strip(), "content": content})
     return out
 
 
-async def _exa_citations(query: str, max_results: int) -> list[dict]:
-    body = {"query": query, "type": "auto", "numResults": max_results, "contents": {"highlights": True}}
+def exa_body(query: str, max_results: int, *, since_year: int | None = None, category: str | None = None) -> dict:
+    contents: dict[str, Any] = {"highlights": True}
+    if settings.web_page_text:
+        contents["text"] = {"maxCharacters": settings.web_page_chars}
+    body: dict[str, Any] = {"query": query, "type": "auto", "numResults": max_results, "contents": contents}
+    if since_year:
+        body["startPublishedDate"] = f"{int(since_year):04d}-01-01T00:00:00.000Z"
+    if category:
+        body["category"] = category
+    return body
+
+
+async def _exa_citations(query: str, max_results: int, **filters: Any) -> list[dict]:
+    body = exa_body(query, max_results, **filters)
     async with httpx.AsyncClient(
         base_url=settings.exa_base_url, timeout=settings.exa_timeout, transport=_exa_transport
     ) as client:
@@ -145,7 +162,7 @@ async def _exa_citations(query: str, max_results: int) -> list[dict]:
         return parse_exa_results(resp.json())[:max_results]
 
 
-async def _openrouter_citations(query: str, max_results: int) -> list[dict]:
+async def _openrouter_citations(query: str, max_results: int, **_filters: Any) -> list[dict]:  # no filters
     resp = await _get_client().chat.completions.create(
         model=settings.model_fast,
         messages=[
@@ -166,10 +183,14 @@ async def _openrouter_citations(query: str, max_results: int) -> list[dict]:
     return parse_citations(message)[:max_results]
 
 
-async def fetch_citations(query: str, max_results: int = 5) -> list[dict]:
+async def fetch_citations(
+    query: str, max_results: int = 5, *, since_year: int | None = None, category: str | None = None
+) -> list[dict]:
     """Network half of ``web_research``: ``[{url, title, content}]`` for the cited pages (no DB access).
 
-    [] when WEB_SEARCH is off, the chosen provider has no API key (and no test override), or on any error.
+    ``since_year`` / ``category`` filter Exa results (published from that year; e.g. "research paper", "news");
+    the OpenRouter provider ignores them. [] when WEB_SEARCH is off, the chosen provider has no API key (and
+    no test override), or on any error.
     """
     if not settings.web_search or not query.strip():
         return []
@@ -183,7 +204,7 @@ async def fetch_citations(query: str, max_results: int = 5) -> list[dict]:
             return []
         fetch = _openrouter_citations
     try:
-        return await fetch(query, max_results)
+        return await fetch(query, max_results, since_year=since_year, category=category)
     except Exception:  # noqa: BLE001 -- network/API failures must never break a research node
         log.exception("web_research (%s) failed for query %r", provider, query)
         return []

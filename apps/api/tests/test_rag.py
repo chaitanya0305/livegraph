@@ -457,7 +457,8 @@ async def test_web_research_exa(session, monkeypatch):
     assert req.method == "POST" and str(req.url) == f"{settings.exa_base_url}/search"
     assert req.headers["x-api-key"] == "test-key"
     assert transport.body() == {
-        "query": "perovskite efficiency", "type": "auto", "numResults": 4, "contents": {"highlights": True},
+        "query": "perovskite efficiency", "type": "auto", "numResults": 4,
+        "contents": {"highlights": True, "text": {"maxCharacters": settings.web_page_chars}},
     }
     assert [d.source_url for d in docs] == ["https://nrel.gov/pv", "https://x.com/a"]
     assert all(d.origin == "web" and d.run_id == run_id for d in docs)
@@ -477,3 +478,49 @@ async def test_web_research_exa_swallows_errors(session, monkeypatch):
     monkeypatch.setattr(rag_web.settings, "web_provider", "exa")
     rag.set_exa_transport(_exa_transport(status=401))
     assert await rag.web_research(session, run_id=uuid.uuid4(), query="q") == []
+
+
+# ---------------------------------------------------------------- full pages, filters, diversity (search depth)
+
+
+def test_parse_exa_results_prefers_page_text():
+    page = "Intro paragraph.\n\n" + "A long body about tandem cells. " * 20
+    out = rag_web.parse_exa_results({"results": [
+        {"url": "https://a.test/p", "title": "A", "text": page, "highlights": ["tandem cells"]},
+        {"url": "https://b.test/p", "title": "B", "text": "short", "highlights": ["a much longer highlight passage"]},
+    ]})
+    assert out[0]["content"] == page.strip()  # the whole page, not the snippet
+    assert out[1]["content"] == "a much longer highlight passage"  # text shorter than the highlights
+
+
+def test_exa_body_filters_and_page_text_switch(monkeypatch):
+    body = rag_web.exa_body("q", 3, since_year=2023, category="research paper")
+    assert body["startPublishedDate"] == "2023-01-01T00:00:00.000Z" and body["category"] == "research paper"
+    assert body["contents"]["text"] == {"maxCharacters": settings.web_page_chars}
+    monkeypatch.setattr(rag_web.settings, "web_page_text", False)
+    assert rag_web.exa_body("q", 3) == {"query": "q", "type": "auto", "numResults": 3, "contents": {"highlights": True}}
+
+
+def test_web_cache_key_includes_filters_only_when_set():
+    from livegraph.agents.tools.rag_tools import norm_query
+
+    assert norm_query("  Solar   Growth ") == "solar growth"  # plain queries keep their old cache keys
+    assert norm_query("Solar growth", since_year=2024, category="news") == "solar growth|since=2024|cat=news"
+
+
+def test_diversify_caps_pages_and_sites():
+    from livegraph.agents.tools.rag_tools import diversify
+    from livegraph.rag.schemas import RetrievedChunk
+
+    def chunk(doc: int, site: str, score: float) -> RetrievedChunk:
+        return RetrievedChunk(
+            chunk_id=uuid.uuid4(), document_id=uuid.UUID(int=doc), document_title=f"d{doc}",
+            source_url=f"https://www.{site}/{doc}", text="t", score=score, trust="normal",
+        )
+
+    ranked = [chunk(1, "a.org", 0.9), chunk(1, "a.org", 0.89), chunk(1, "a.org", 0.88), chunk(2, "a.org", 0.87),
+              chunk(3, "b.org", 0.5), chunk(4, "c.org", 0.4)]
+    out = diversify(ranked, 4)
+    docs = [int(c.document_id) for c in out]
+    assert docs == [1, 1, 3, 4]  # page 1 capped at 2, site a.org capped at 2 (page 2 skipped)
+    assert len(diversify(ranked[:3], 3)) == 3  # caps never leave slots empty when nothing else is left
