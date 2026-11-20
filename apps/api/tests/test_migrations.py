@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from livegraph.db.base import Base
 from livegraph.db.migrate import BASELINE, alembic_config, migrate
-from tests.conftest import _ADMIN_DSN
+from tests.conftest import _ADMIN_DSN, _PG
 
 MIGR_DB = "livegraph_migr"
 
@@ -33,7 +33,7 @@ async def _recreate() -> None:
 async def migr_engine():
     await _recreate()
     eng = create_async_engine(
-        f"postgresql+asyncpg://livegraph:livegraph@localhost:5433/{MIGR_DB}", poolclass=pool.NullPool
+        f"postgresql+asyncpg://livegraph:livegraph@{_PG}/{MIGR_DB}", poolclass=pool.NullPool
     )
     yield eng
     await eng.dispose()
