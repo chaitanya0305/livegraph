@@ -32,6 +32,9 @@ are environment overrides on the API process (`lgeval/runners/configs.py`), defa
 | `no_critic` | No critic nodes, so no follow-up research | self-critique / research expansion |
 | `single_shot` | `AGENT_TOOLS` emptied: every node is one model call without tools | agentic tool use |
 | `no_context_tools` | `CONTEXT_TOOLS=false` | cross-agent context reading |
+| `old_search` | The pre-loop research agent: single pass on highlight snippets (`RESEARCH_LOOP=false`, `WEB_PAGE_TEXT=false`), follow-ups never chained (`FOLLOW_UP_MAX_DEPTH=1`), no planner scouting (`PLAN_WEB_SEARCH=false`) | the search-depth changes as a whole |
+| `research_reasoning` | Research agents also use the model's hidden reasoning (`REASONING_NODES` + `research`) | hidden reasoning on top of the explicit `reflect` step |
+| `budget_x0.5`, `budget_x2` | `RESEARCH_BUDGET_SCALE` 0.5 / 2: research tool budgets and request cap halved / doubled | search depth (test-time scaling sweep) |
 | `single_agent` | One tool-using agent with the same models and the same `web_search`/`search_documents` tools writes a cited brief in one go | the whole multi-agent graph |
 | external (`chatgpt_dr`, `gemini_dr`, `perplexity_dr`, ...) | Commercial deep-research products, collected manually and imported | state of practice |
 
@@ -72,6 +75,7 @@ models, tools and budgets differ and cannot be controlled); they are reported de
 | Pairwise preference | Judge compares two briefs on factuality, sourcing and usefulness; run in both orders, a win counts only if both orders agree, else tie; win rate = (W + T/2)/n with Wilson 95% CI; Bradley–Terry strengths when ≥3 systems are compared | Zheng et al. (2023); Bradley & Terry (1952); Wilson (1927) |
 | Calibration | Each LiveGraph claim labelled true/false/unverifiable against evidence + web (LLM labeler, human-audited); Brier score, ECE (10 equal-width bins), AUROC of confidence vs. truth, reliability diagram; struck-false rate = share of struck claims that are false | Brier (1950); Naeini et al. (2015); Guo et al. (2017) |
 | Recompute efficiency | Per update: cost and wall time as % of the baseline ("start over" = a fresh run of the mutated goal, or the original run), nodes recomputed / reused / impacted (`GET /impact` upper bound) | — |
+| Search behaviour | Per research node, from run snapshots (no judge; `score --metrics search`, Table 6): tool calls, share that hit a tool budget, share stopped by the loop's stop rule, `reflect` rounds, share with a challenge search, distinct sites cited, cited/retrieved chunks; follow-ups per run | — |
 | Cost, time | Token usage per model × OpenRouter prices pinned at study start; wall time from run creation to settled | — |
 
 **Uncertainty.** Repeats are averaged per question first; the question is the resampling unit. 95%
@@ -214,4 +218,6 @@ gitignored; we publish them as a release artifact alongside the paper.
 
 | Date | Change | Reason |
 |---|---|---|
-| — | — | — |
+| 2026-11-19 | Research agents changed after the Oct 2026 pilot: page text instead of highlight snippets for web results (also for the `single_agent` baseline, which shares `fetch_citations`), a round-based research loop with `reflect` and a stop rule, planner scouting and per-node priority, chained follow-ups (depth 2, at most 4 per run), `thin` critic verdicts always followed up, an editor check for passages that reference no claim. New configs `old_search`, `research_reasoning`, `budget_x0.5`, `budget_x2`; new search-behaviour metrics. The pilot's numbers describe the pre-loop agent (= `old_search`). | Pilot diagnosis: 96% of research nodes ran into a tool budget, no counter-evidence searches, 16 of 17 `thin` verdicts produced no follow-up, 31% of brief facts unsupported by retrieved evidence. |
+| 2026-11-19 | Each node type's agent version (prompts, limits, tools, model, relevant settings) is part of its input hash. | Results produced by an older agent must not be reused by a newer one; changing one agent invalidates only that node type (downstream reruns only where its output changes). One-time effect: runs made before this change recompute fully on their next update. |
+| 2026-11-20 | Claims, prosecutor and defender see up to 100 research chunks (600 chars each): every research node's cited chunks first, round-robin across nodes, then uncited ones. Previously the first 24 chunks (900 chars), so with the deeper research (about 10 research nodes and 104 cited chunks per run) about three quarters of the cited evidence never reached the claims writer. | Measured on the 10 custom questions by rerunning claims and everything after it on the same runs (research unchanged): citation recall 0.33 to 0.56, uncited sentences 41% to 19%, citation precision 0.28 to 0.30, factual precision unchanged (0.61 to 0.60). |
