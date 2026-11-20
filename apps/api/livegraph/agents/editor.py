@@ -22,6 +22,8 @@ SYSTEM = """You are the Editor. Write a crisp, well-structured brief in markdown
 Rules: use only the claims provided; EXCLUDE struck claims entirely; state high-confidence claims (>= 0.75)
 plainly; hedge medium-confidence claims (0.4-0.75) with words like "likely"/"some evidence suggests";
 mention low-confidence claims (< 0.4) only as open questions. Reference claims inline as (C1), (C2).
+Never add facts, numbers, dates, names or causes that are not in the claims, even if you know them: every
+paragraph and bullet outside the headings and "Open questions" must rest on at least one referenced claim.
 Start with a one-paragraph bottom line, then sections, then "Open questions"."""
 
 # no judge ran (DISABLED_NODE_TYPES ablation): claims carry no confidence
