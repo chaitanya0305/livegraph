@@ -1,4 +1,4 @@
-.PHONY: db api web dev test up down logs db-upgrade db-rev db-check db-stamp
+.PHONY: db api web dev test eval-test up down logs db-upgrade db-rev db-check db-stamp
 db:
 	docker compose up -d --wait db
 api:
@@ -10,6 +10,8 @@ dev: db
 test:
 	cd apps/api && uv run pytest -q
 	cd apps/web && npm run typecheck
+eval-test:  # lgeval harness tests (offline: no network, API key or Postgres)
+	cd apps/api && uv run pytest lgeval/tests -q
 up:
 	docker compose up -d --build --wait
 down:

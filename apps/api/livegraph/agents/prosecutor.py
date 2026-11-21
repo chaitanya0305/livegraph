@@ -5,7 +5,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from livegraph.agents import debate, validators
-from livegraph.agents.base import AgentContext, AgentFactory, cite
+from livegraph.agents.base import AgentContext, AgentFactory, cite, evidence_settings
 from livegraph.agents.debate import build_debate_prompt
 
 TYPE = "prosecutor"
@@ -30,6 +30,10 @@ cite exact `chunk_id`s (verbatim UUIDs from the evidence list) in `chunk_ids` wh
 objection. Never invent chunk ids. One attack per claim, referencing it by `claim_key` (C1, C2, ...)."""
 
 LIMITS = debate.LIMITS
+
+
+def recipe_settings() -> dict:
+    return evidence_settings()
 
 agents = AgentFactory(
     "prosecutor", ProsecutorOutput, SYSTEM, tool_system=debate.TOOL_SYSTEM, tools=debate.TOOLS,

@@ -39,6 +39,7 @@ class NodeDeps:
     # scope rule for the context tools: {node_key: current version id} of transitive active ancestors
     readable: dict[str, UUID] = field(default_factory=dict)
     recall_enabled: bool = False  # the agent has the context tools: its history may be compacted to stubs
+    request_cap: int | None = None  # this run's hard request limit (run_agent sets it; base.wind_down reads it)
     # shared with nested (agent-as-tool) runs
     retrieved: dict[str, RetrievedChunk] = field(default_factory=dict)
     via: dict[str, str] = field(default_factory=dict)
@@ -56,6 +57,16 @@ class NodeDeps:
     # history compaction (agents/history.py): tool return (context.part_key) -> ref, and ref -> stub line
     refs: dict[str, str] = field(default_factory=dict)
     stubs: dict[str, str] = field(default_factory=dict)
+    # research rounds (agents/tools/research_tools.py): web_search kinds used, the reflect log (one entry per
+    # round: open gaps, new documents), the documents seen at the last reflect, and the stop flag that withdraws
+    # the search tools (base.wind_down)
+    query_kinds: dict[str, int] = field(default_factory=dict)
+    rounds: list[dict[str, Any]] = field(default_factory=list)
+    docs_at_reflect: set[str] = field(default_factory=set)
+    search_stopped: bool = False
+
+    def doc_ids_seen(self) -> set[str]:
+        return {str(c.document_id) for c in self.retrieved.values()}
 
     def __post_init__(self) -> None:
         self.agent = self.agent or self.node_type

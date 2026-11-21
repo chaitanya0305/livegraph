@@ -11,6 +11,7 @@ of graph edits applies in the order it was emitted.
 from __future__ import annotations
 
 import html
+from typing import Literal
 
 from pydantic_ai import RunContext, Tool
 from pydantic_ai.tools import ToolDefinition
@@ -27,6 +28,7 @@ async def add_node(
     title: str,
     question: str | None = None,
     instructions: str | None = None,
+    priority: Literal["high", "normal", "low"] | None = None,
 ) -> str:
     """Add a node to the graph.
 
@@ -36,14 +38,19 @@ async def add_node(
         title: short human readable title.
         question: for research nodes, the research question.
         instructions: optional extra instructions for the node (for human_input: the question for the user).
+        priority: for research nodes: high (the answer hinges on it: more search budget), normal or low.
     """
 
     async def impl() -> ToolOut:
         return await ctx.deps.sched.tool_add_node(
-            ctx.deps, key=key, type=type, title=title, question=question, instructions=instructions
+            ctx.deps, key=key, type=type, title=title, question=question, instructions=instructions,
+            priority=priority,
         )
 
-    args = {"key": key, "type": type, "title": title, "question": question, "instructions": instructions}
+    args = {
+        "key": key, "type": type, "title": title, "question": question, "instructions": instructions,
+        "priority": priority,
+    }
     return await run_tool(
         ctx, "add_node", {k: v for k, v in args.items() if v is not None}, impl, cacheable=False, store=False
     )

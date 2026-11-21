@@ -48,7 +48,7 @@ from livegraph import rag
 from livegraph.agents import SPECS, context
 from livegraph.agents import critic as critic_mod
 from livegraph.agents import research as research_mod
-from livegraph.agents.base import AgentContext, AgentLimits, ParentOutput
+from livegraph.agents.base import AgentContext, AgentLimits, ParentOutput, limits_of, recipe
 from livegraph.agents.deps import NodeDeps
 from livegraph.agents.guard import ToolOut
 from livegraph.agents.human_input import prompt_for
@@ -56,7 +56,7 @@ from livegraph.agents.models import model_for
 from livegraph.agents.runner import run_agent
 from livegraph.agents.tools import context_tools
 from livegraph.agents.tools.rag_tools import web_doc_ids
-from livegraph.config import settings, tools_enabled
+from livegraph.config import disabled_types, settings, tools_enabled
 from livegraph.db import base as db_base
 from livegraph.db.models import Claim, ClaimHistory, Edge, Node, NodeVersion, Run, SteerMessage
 from livegraph.engine.hashing import input_hash, input_ref, output_hash
@@ -77,6 +77,14 @@ EVIDENCE_TYPES = ("claims", "prosecutor", "defender", "judge", "editor")
 UPSTREAM_MAX_CHARS = 500  # request_upstream_work instruction cap
 UPSTREAM_FORBIDDEN = ("plan", "human_input")  # request_upstream_work targets that cannot be steered by agents
 IMPACT_ACTIONS = ("steer", "rerun", "config", "edit", "restore", "veto")
+
+
+def _follow_up_depth(n: Node) -> int:
+    """0 for planned research; a follow-up's depth (``params.depth``; older follow-ups without it are depth 1)."""
+    params = (n.config or {}).get("params") or {}
+    if not params.get("follow_up"):
+        return 0
+    return int(params.get("depth") or 1)
 
 
 def _uses_corpus(node_type: str) -> bool:
@@ -456,10 +464,9 @@ class RunScheduler:
         cache[key] = value
 
     async def _ancestor_evidence(self, s: AsyncSession, g: Graph, n: Node) -> list[dict[str, Any]]:
-        vids = [
-            a.current_version_id for a in g.ancestors(n.id)
-            if a.type == "research" and not Graph.inactive(a) and a.current_version_id
-        ]
+        research = [a for a in g.ancestors(n.id) if a.type == "research" and not Graph.inactive(a) and a.current_version_id]
+        vids = [a.current_version_id for a in research]
+        key_of = {a.current_version_id: a.key for a in research}
         key = frozenset(vids)
         if key in self._evidence_cache:  # versions are immutable; trust changes clear the cache
             return list(self._evidence_cache[key])
@@ -468,6 +475,7 @@ class RunScheduler:
         for vid in vids:
             for r in rows.get(vid, []):
                 cid = str(r["chunk_id"])
+                r = {**r, "research": key_of[vid]}  # which research node found it (round-robin in prompts)
                 if cid not in seen:
                     seen[cid] = r
                 elif r["score"] > seen[cid]["score"] or r.get("cited"):
@@ -535,6 +543,12 @@ class RunScheduler:
             return input_ref(x.key, x.current_version_id, hashes.get(x.current_version_id))
 
         config = n.config or {}
+        spec = SPECS.get(n.type)
+        uses_tools = _uses_tools(n.type)
+        agent_version = None
+        if spec is not None:  # human_input has no model (TIER None): its recipe is just its (empty) agent shape
+            model = model_for(n.type, spec.TIER) if getattr(spec, "TIER", None) else None
+            agent_version = recipe(spec, model, uses_tools, {"context_tools": reads_ctx})
         return input_hash(
             node_type=n.type,
             config=config,
@@ -545,6 +559,7 @@ class RunScheduler:
             title=n.title,
             question=(config.get("question") or n.title) if n.type == "research" else None,
             ancestors=[ref(a) for a in extra],
+            recipe=agent_version,
         )
 
     async def _find_version_by_hash(self, s: AsyncSession, nid: UUID, h: str) -> NodeVersion | None:
@@ -641,9 +656,10 @@ class RunScheduler:
                 ctx = await self._context(s, g, n, run, steer_texts)
                 node_type, node_key = n.type, n.key
                 question = (n.config or {}).get("question") or n.title
+                node_config = dict(n.config or {})
 
         uses_tools = _uses_tools(node_type)
-        limits: AgentLimits | None = getattr(spec, "LIMITS", None)
+        limits: AgentLimits | None = limits_of(spec, node_config)
         reads_context = uses_tools and settings.context_tools and context_tools.has_context_tools(spec.agents)
         budgets = {**(context_tools.BUDGETS if reads_context else {}), **(limits.budgets if limits else {})}
         deps = NodeDeps(
@@ -740,7 +756,11 @@ class RunScheduler:
                 self.force.discard(nid)
                 self.tasks.pop(nid, None)
                 await self.set_node_status(s, n, "done")
-                if node_type == "critic" and not uses_tools:  # single-shot fallback: follow-up from the output
+                # a `thin` verdict always gets its follow-up: single-shot critics have no tool, and tool-using
+                # critics often return `thin` without calling request_follow_up_research (16 of 17 in the Oct
+                # 2026 pilot). critic_follow_up is idempotent (an existing follow-up is kept) and enforces the
+                # depth and per-run limits.
+                if node_type == "critic":
                     out = critic_mod.CriticOutput.model_validate(output.model_dump())
                     if out.verdict == "thin" and (out.follow_up_question or "").strip():
                         await self.critic_follow_up(s, n, out.follow_up_question)
@@ -875,9 +895,12 @@ class RunScheduler:
     async def critic_follow_up(self, s: AsyncSession, critic: Node, question: str) -> ToolOut:
         """Add one follow-up research node (``{research_key}_fu``) and the edge critic -> follow-up.
 
-        Never chains (no follow-ups of follow-ups) and at most one per research node. The follow-up's edges
-        into claims are added by ``_attach_follow_ups`` once the critic's version persists, so a running or
-        finished claims node is never disturbed by a critic that is still thinking."""
+        At most one per research node. Follow-ups chain up to FOLLOW_UP_MAX_DEPTH (a planned research node is
+        depth 0; its follow-up depth 1, ...), and a run gets at most MAX_FOLLOW_UPS_PER_RUN; a follow-up below
+        the max depth gets its own critic (``c_{key}``, which claims waits for like every critic), so its gaps
+        can be followed up in turn. The follow-up's edges into claims are added by ``_attach_follow_ups`` once
+        the critic's version persists, so a running or finished claims node is never disturbed by a critic
+        that is still thinking."""
         q = (question or "").strip()
         if not q:
             return ToolOut(text="error: empty question", summary="empty question", ok=False, error="empty question")
@@ -886,21 +909,33 @@ class RunScheduler:
         if not sources:
             return ToolOut(text="error: no research to follow up", summary="no research input", ok=False,
                            error="no research input")
-        if any((p.config.get("params") or {}).get("follow_up") for p in sources):
-            return ToolOut(text="follow-ups of follow-up research are not allowed; return your verdict",
-                           summary="no chaining", ok=False, error="no chaining")
         src = sources[0]
+        depth = _follow_up_depth(src) + 1
+        if depth > settings.follow_up_max_depth:
+            return ToolOut(text=f"follow-up depth limit ({settings.follow_up_max_depth}) reached; return your verdict",
+                           summary="depth limit", ok=False, error="depth limit")
         key = f"{src.key}_fu"
         if key in g.by_key:
             return ToolOut(text=f"follow-up research {key} already exists; return your verdict",
                            summary=f"{key} already exists", node_ids=[str(g.by_key[key].id)])
+        n_follow_ups = sum(
+            1 for n in g.nodes.values() if n.type == "research" and not n.removed and _follow_up_depth(n) > 0
+        )
+        if n_follow_ups >= settings.max_follow_ups_per_run:
+            return ToolOut(text=f"this run already has {n_follow_ups} follow-ups (the limit); return your verdict",
+                           summary="follow-up limit", ok=False, error="follow-up limit")
         new = await self.add_node(
             s, key=key, type="research", title=f"Follow-up: {src.title}"[:120],
-            question=q, created_by="critic", params={"follow_up": True, "critic": critic.key},
+            question=q, created_by="critic", params={"follow_up": True, "critic": critic.key, "depth": depth},
         )
         await self.add_edge(s, critic.key, new.key)
+        ids = [str(new.id)]
+        if depth < settings.follow_up_max_depth and "critic" not in disabled_types():
+            c = await self.add_node(s, key=f"c_{new.key}", type="critic", title=f"Critique {new.key}", created_by="critic")
+            await self.add_edge(s, new.key, c.key)
+            ids.append(str(c.id))
         return ToolOut(text=f"added follow-up research node {new.key}; it runs before the claims. Return your verdict.",
-                       summary=f"+ research {new.key}", node_ids=[str(new.id)])
+                       summary=f"+ research {new.key}", node_ids=ids)
 
     async def _attach_follow_ups(self, s: AsyncSession, critic: Node) -> None:
         g = await load_graph(s, self.run_id)
@@ -994,7 +1029,7 @@ class RunScheduler:
 
     async def tool_add_node(
         self, deps: NodeDeps, *, key: str, type: str, title: str, question: str | None = None,
-        instructions: str | None = None,
+        instructions: str | None = None, priority: str | None = None,
     ) -> ToolOut:
         if type == "plan":
             return ToolOut(text="error: the plan node already exists", summary="rejected", ok=False,
@@ -1007,7 +1042,10 @@ class RunScheduler:
                     n = g.by_key[_slug(key)]
                     return ToolOut(text=f"node {n.key} already exists", summary=f"{n.key} exists", node_ids=[str(n.id)])
                 try:
-                    n = await self.add_node(s, key=key, type=type, title=title, question=question, instructions=instructions)
+                    params = {"priority": priority} if type == "research" and priority in ("high", "low") else None
+                    n = await self.add_node(
+                        s, key=key, type=type, title=title, question=question, instructions=instructions, params=params
+                    )
                 except EngineError as e:
                     return ToolOut(text=f"error: {e}", summary=str(e), ok=False, error=str(e))
         return ToolOut(text=f"added node {n.key}", summary=f"+ {n.type} {n.key}", node_ids=[str(n.id)])
@@ -1039,6 +1077,8 @@ class RunScheduler:
     ) -> Node:
         if type not in SPECS:
             raise EngineError(f"unknown node type {type!r}; expected one of {sorted(SPECS)}")
+        if type in disabled_types():
+            raise EngineError(f"node type {type!r} is disabled in this deployment (DISABLED_NODE_TYPES); leave it out")
         config: dict[str, Any] = {"instructions": instructions, "params": params or {}}
         if question:
             config["question"] = question
@@ -1059,6 +1099,8 @@ class RunScheduler:
             raise EngineError(f"unknown node key: {source_key if src is None else target_key}")
         if src.id == tgt.id or g.reachable(tgt.id, src.id):
             raise EngineError(f"edge {source_key}->{target_key} would create a cycle")
+        if tgt.type == "plan":  # the plan runs first; an input would make it wait on its own graph
+            raise EngineError(f"edge {source_key}->{target_key}: the plan node takes no inputs")
         if tgt.id in g.children.get(src.id, []):
             return None
         e = Edge(run_id=self.run_id, source_node_id=src.id, target_node_id=tgt.id)
@@ -1095,7 +1137,7 @@ class RunScheduler:
             run = await s.get(Run, self.run_id)
             if qs == [plan.title]:
                 qs = [run.goal]
-            for i, q in enumerate(qs[:5], 1):
+            for i, q in enumerate(qs[: max(3, settings.plan_max_research)], 1):
                 await self.add_node(s, key=unique(f"r{i}"), type="research", title=q[:80], question=q)
                 g = await refresh()
             research = of_type("research")
@@ -1103,8 +1145,9 @@ class RunScheduler:
             if not g.parents.get(r.id):
                 await self.add_edge(s, plan.key, r.key)
         g = await refresh()
+        off = disabled_types()
         for i, r in enumerate(of_type("research"), 1):
-            if (r.config.get("params") or {}).get("follow_up"):
+            if "critic" in off or (r.config.get("params") or {}).get("follow_up"):
                 continue
             if not any(g.nodes[c].type == "critic" for c in g.children.get(r.id, [])):
                 c = await self.add_node(s, key=unique(f"c{i}"), type="critic", title=f"Critique {r.key}")
@@ -1122,11 +1165,11 @@ class RunScheduler:
         g = await refresh()
         claim_key = claims[0].key
         for t, title in (("prosecutor", "Prosecutor"), ("defender", "Defender")):
-            if not of_type(t):
+            if not of_type(t) and t not in off:
                 await self.add_node(s, key=unique(t), type=t, title=title)
                 await self.add_edge(s, claim_key, of_type_key(await refresh(), t))
                 g = await refresh()
-        if not of_type("judge"):
+        if not of_type("judge") and "judge" not in off:
             j = await self.add_node(s, key=unique("judge"), type="judge", title="Judge")
             await self.add_edge(s, claim_key, j.key)
             g = await refresh()
@@ -1134,10 +1177,18 @@ class RunScheduler:
                 for n in of_type(t):
                     await self.add_edge(s, n.key, j.key)
             g = await refresh()
+        # the editor follows the judge; without one (DISABLED_NODE_TYPES) the debaters, else the claims
+        feeders = of_type("judge") or of_type("prosecutor") + of_type("defender") or claims
         if not of_type("editor"):
             e = await self.add_node(s, key=unique("editor"), type="editor", title="Editor")
-            for j in of_type("judge"):
-                await self.add_edge(s, j.key, e.key)
+            for f in feeders:
+                await self.add_edge(s, f.key, e.key)
+        elif off:
+            g = await refresh()
+            for e in of_type("editor"):
+                if not any(a.type == "claims" for a in g.ancestors(e.id)):
+                    for f in feeders:
+                        await self.add_edge(s, f.key, e.key)
         # any other orphan (no parents, not plan) hangs off the plan
         g = await refresh()
         for n in g.nodes.values():

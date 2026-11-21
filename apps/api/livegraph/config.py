@@ -40,9 +40,36 @@ class Settings(BaseSettings):
     output_mode_agents: str = "prompted"
     # Node types that run as tool-using agents (comma-separated). Others fall back to single-shot calls.
     agent_tools: str = "research,prosecutor,defender,judge,critic,plan"
+    # Ablation knob (evaluation): node types never added to a graph (comma-separated, from DISABLABLE_TYPES);
+    # the default shape is rewired around them (e.g. claims -> editor without the debate). Empty = off.
+    disabled_node_types: str = ""
+    # How much research evidence the claims writer and the debaters see in their prompt: cited chunks first,
+    # taken round-robin across research nodes, then uncited ones (pre-Nov 2026: the first 24 chunks, 900 chars)
+    evidence_prompt_chunks: int = 100
+    evidence_prompt_chars: int = 600
     research_seed_k: int = 4  # chunks the engine retrieves up front as a research agent's starting evidence
     search_k_max: int = 8  # cap on `k` for the search_documents tool
-    web_search_max_per_node: int = 2  # soft cap on web_search calls per research node
+    # soft cap on web_search calls per research node (RESEARCH_LOOP=false; the loop uses research_web_max)
+    web_search_max_per_node: int = 2
+    # Web pages: ingest each result's page text (Exa `contents.text`, up to web_page_chars) instead of only its
+    # highlight snippets, so agents search and read whole pages. false = highlights only (pre-loop behaviour).
+    web_page_text: bool = True
+    web_page_chars: int = 12_000
+    # Research loop: research agents work in rounds (explore -> reflect -> target gaps + challenge -> reflect)
+    # and stop when a round adds little; false = the previous single-pass prompt, budgets and tools.
+    research_loop: bool = True
+    research_max_rounds: int = 3  # reflect calls before the search tools are withdrawn
+    research_min_new_docs: int = 2  # from round 2 on, a round adding fewer new documents ends the search
+    research_web_max: int = 4  # web_search budget per research node in the loop (before scaling)
+    # multiplies every research budget and request limit (evaluation sweep of search depth); priority scales on top
+    research_budget_scale: float = 1.0
+    # Critic follow-ups: depth 1 = follow-ups cannot be followed up (the previous rule); 2 = one more level,
+    # each follow-up below the max depth getting its own critic. At most max_follow_ups_per_run in a run.
+    follow_up_max_depth: int = 2
+    max_follow_ups_per_run: int = 4
+    # the planner may scout the topic with web_search before choosing its research nodes
+    plan_web_search: bool = True
+    plan_max_research: int = 7  # research nodes the planner may add (3..this)
     fetch_page: bool = False  # enable the fetch_page tool (research, planner)
     fetch_max_bytes: int = 400_000
     fetch_timeout: float = 10.0
@@ -71,6 +98,14 @@ class Settings(BaseSettings):
 def tools_enabled(node_type: str) -> bool:
     """AGENT_TOOLS kill switch: True when ``node_type`` runs as a tool-using agent."""
     return node_type in {t.strip() for t in settings.agent_tools.split(",") if t.strip()}
+
+
+DISABLABLE_TYPES = ("critic", "prosecutor", "defender", "judge", "human_input")
+
+
+def disabled_types() -> set[str]:
+    """DISABLED_NODE_TYPES ablation knob: node types the planner/engine never add (unknown names ignored)."""
+    return {t.strip() for t in settings.disabled_node_types.split(",") if t.strip()} & set(DISABLABLE_TYPES)
 
 
 @lru_cache

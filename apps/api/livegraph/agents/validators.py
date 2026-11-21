@@ -1,8 +1,8 @@
 """Output validators (``@agent.output_validator``): bounce bad outputs back to the model with ``ModelRetry``.
 
-They are skipped for partial (streaming) outputs. Once the output-retry budget is spent they repair the
-output instead (the old ``sanitize`` behaviour: drop what is invalid), so a stubborn model degrades
-gracefully rather than failing the node.
+They are skipped for partial (streaming) outputs. Once the output-retry budget is spent, or the run has used
+the last request its hard cap allows, they repair the output instead (the old ``sanitize`` behaviour: drop
+what is invalid), so a stubborn model degrades gracefully rather than failing the node.
 """
 
 from __future__ import annotations
@@ -22,8 +22,14 @@ def _active(ctx: RunContext[NodeDeps | None]) -> bool:
     return not ctx.partial_output and isinstance(ctx.deps, NodeDeps)
 
 
+def _out_of_requests(ctx: RunContext[Any]) -> bool:
+    """A retry would need one more request than the run's hard cap allows (deps.request_cap, see base.wind_down)."""
+    cap = getattr(ctx.deps, "request_cap", None)
+    return cap is not None and ctx.usage.requests >= cap
+
+
 def _retry_or(ctx: RunContext[Any], problems: list[str], repair: Callable[[], Any]) -> Any:
-    if problems and ctx.retry < ctx.max_retries:
+    if problems and ctx.retry < ctx.max_retries and not _out_of_requests(ctx):
         raise ModelRetry("Fix these problems and answer again: " + "; ".join(problems[:8]))
     return repair()
 
@@ -107,6 +113,29 @@ async def judge(ctx: RunContext[NodeDeps], out: Any) -> Any:
 
 
 _REF = re.compile(r"\((C\d+(?:\s*,\s*C\d+)*)\)")
+_ANY_REF = re.compile(r"\bC\d+\b")
+UNCITED_MIN_CHARS = 120  # shorter blocks (headings, one-line bullets, transitions) are not checked
+
+
+def uncited_blocks(markdown: str) -> list[str]:
+    """Paragraphs and list items of the brief (outside "Open questions") long enough to state facts that
+    reference no claim: the editor added content no claim supports."""
+    out: list[str] = []
+    in_open = False
+    for block in re.split(r"\n\s*\n", markdown or ""):
+        b = block.strip()
+        if not b:
+            continue
+        if b.startswith("#"):
+            in_open = "open question" in b.splitlines()[0].lower()
+            b = "\n".join(b.splitlines()[1:]).strip()
+            if not b:
+                continue
+        if in_open:
+            continue
+        items = re.split(r"\n(?=\s*(?:[-*]|\d+[.)])\s)", b)
+        out += [i.strip() for i in items if len(i.strip()) >= UNCITED_MIN_CHARS and not _ANY_REF.search(i)]
+    return out
 
 
 async def editor(ctx: RunContext[NodeDeps], out: Any) -> Any:
@@ -115,6 +144,10 @@ async def editor(ctx: RunContext[NodeDeps], out: Any) -> Any:
     ok = set(_claim_keys(ctx.deps, active_only=True))
     bad = sorted({k.strip() for m in _REF.finditer(out.markdown) for k in m.group(1).split(",") if k.strip() not in ok})
     problems = [f"({k}) is struck or unknown: do not reference or state it" for k in bad]
+    problems += [
+        f'this passage references no claim; support it with (Cn) references or remove what no claim states: "{b[:80]}..."'
+        for b in uncited_blocks(out.markdown)[:3]
+    ]
 
     def repair() -> None:
         def fix(m: re.Match[str]) -> str:

@@ -6,8 +6,9 @@ import asyncio
 import os
 
 TEST_DB = "livegraph_test"
-_ADMIN_DSN = "postgresql://livegraph:livegraph@localhost:5433/livegraph"
-os.environ["DATABASE_URL"] = f"postgresql+asyncpg://livegraph:livegraph@localhost:5433/{TEST_DB}"
+_PG = os.environ.get("LIVEGRAPH_TEST_PG", "localhost:5433")  # host:port of the Postgres the tests use
+_ADMIN_DSN = f"postgresql://livegraph:livegraph@{_PG}/livegraph"
+os.environ["DATABASE_URL"] = f"postgresql+asyncpg://livegraph:livegraph@{_PG}/{TEST_DB}"
 os.environ["OPENROUTER_API_KEY"] = ""
 os.environ["WEB_SEARCH"] = "off"
 os.environ["EXA_API_KEY"] = ""  # never call Exa from tests, even when apps/api/.env has a key

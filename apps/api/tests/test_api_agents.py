@@ -82,7 +82,7 @@ async def test_research_tool_loop_trace_and_retrievals(client):
     calls = [e for e in _node_events(evs, r1, "tool.call") if e["payload"]["attempt_id"] == attempt_id]
     assert [e["payload"]["call_id"] for e in calls] == [s["call_id"] for s in trace]
     ws = next(e["payload"] for e in calls if e["payload"]["tool"] == "web_search")
-    assert ws["step"] == 1 and ws["budget"] == settings.web_search_max_per_node and ws["args_summary"]
+    assert ws["step"] == 1 and ws["budget"] == research_mod.limits({}).budgets["web_search"] and ws["args_summary"]
     results = {e["payload"]["call_id"]: e["payload"] for e in _node_events(evs, r1, "tool.result")}
     assert set(results) == {s["call_id"] for s in trace}
     assert all(isinstance(p["ms"], int) and p["error"] is None for p in results.values())
@@ -100,7 +100,8 @@ async def test_research_tool_loop_trace_and_retrievals(client):
     assert_fold_matches(snap, evs)
 
 
-async def test_budget_exhaustion_finishes_gracefully(client, fake):
+async def test_budget_exhaustion_finishes_gracefully(client, fake, monkeypatch):
+    monkeypatch.setattr(settings, "research_web_max", 2)  # the 3rd web_search is past the budget
     seen: list[str] = []
 
     def script(text: str, rnd: int):
@@ -229,13 +230,18 @@ async def test_critic_tool_adds_follow_up_without_cancelling_claims(client, fake
     nodes = by_key(snap)
     fu, claims = nodes["r1_fu"], nodes["claims"]
     step = next(s for s in snap["versions"][nodes["c1"]["id"]]["trace"] if s["tool"] == "request_follow_up_research")
-    assert step["ok"] and step["node_ids"] == [fu["id"]]
+    # below FOLLOW_UP_MAX_DEPTH (2) the follow-up gets its own critic, wired follow-up -> critic
+    fu_critic = nodes["c_r1_fu"]
+    assert step["ok"] and step["node_ids"] == [fu["id"], fu_critic["id"]]
+    assert fu["config"]["params"]["depth"] == 1 and fu_critic["type"] == "critic"
+    assert any(e["source_node_id"] == fu["id"] and e["target_node_id"] == fu_critic["id"] for e in snap["edges"])
     evs = await events(client, run_id)
     claims_status = [e["payload"]["status"] for e in _node_events(evs, claims["id"], "node.status")]
     assert claims_status == ["running", "done"]  # never started early, never cancelled
-    fu_done = max(e["seq"] for e in _node_events(evs, fu["id"], "node.status") if e["payload"]["status"] == "done")
     claims_run = next(e["seq"] for e in _node_events(evs, claims["id"], "node.status"))
-    assert claims_run > fu_done
+    for n in (fu, fu_critic):  # claims waits for the follow-up and for its critic
+        done = max(e["seq"] for e in _node_events(evs, n["id"], "node.status") if e["payload"]["status"] == "done")
+        assert claims_run > done
     assert len(await versions(client, claims["id"])) == 1
     assert_fold_matches(snap, evs)
 

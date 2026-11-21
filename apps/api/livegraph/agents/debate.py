@@ -8,7 +8,9 @@ from livegraph.agents.base import (
     AgentContext,
     AgentLimits,
     format_claims,
+    evidence_settings,
     format_evidence,
+    format_research_evidence,
     format_instructions,
     format_steer,
 )
@@ -24,13 +26,13 @@ targeted calls where they would change your argument, then answer. Cite any chun
 BUDGET EXHAUSTED, stop calling it and finalize. If an upstream input is missing something decisive,
 `request_upstream_work(target_node_key, instruction)` asks that agent to redo its work after you answer."""
 
-LIMITS = AgentLimits(request_limit=8, timeout=300, budgets={"web_search": 1, "search_documents": 4, "read_source": 3})
+LIMITS = AgentLimits(request_limit=10, timeout=300, budgets={"web_search": 1, "search_documents": 4, "read_source": 3})
 
 
 def build_debate_prompt(ctx: AgentContext) -> str:
     return (
         f"## Goal\n{ctx.goal}\n\n## Claims\n{format_claims(ctx.claims)}\n\n## Evidence chunks\n"
-        f"{format_evidence(ctx.evidence)}{format_instructions(ctx)}{format_steer(ctx)}"
+        f"{format_research_evidence(ctx.evidence)}{format_instructions(ctx)}{format_steer(ctx)}"
     )
 
 

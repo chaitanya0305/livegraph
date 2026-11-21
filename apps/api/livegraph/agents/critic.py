@@ -24,8 +24,14 @@ class CriticOutput(BaseModel):
 Output = CriticOutput
 
 SYSTEM = """You are a demanding research critic. Judge whether the research result adequately answers its
-question with cited evidence. Answer `thin` only if there are clear gaps, few/no citations, or the findings
-do not address the question; then give exactly one focused `follow_up_question`. Otherwise answer `ok`."""
+question with cited evidence. Answer `thin` when any of these holds:
+- a gap the research lists (or one you see) matters for answering the goal;
+- findings are uncited, vague (no numbers, dates or names where the question needs them), or do not address
+  the question;
+- the search record shows no challenge search on a contested question, or the cited evidence comes from two
+  sites or fewer.
+Then give exactly one focused `follow_up_question` that targets the most important open gap (a concrete
+question a web search can answer, not a restatement of the original question). Otherwise answer `ok`."""
 
 TOOL_SYSTEM = """
 
@@ -33,7 +39,7 @@ When the verdict is `thin`, FIRST call `request_follow_up_research(question)` ex
 follow-up question (it adds a research node to the graph that runs before the claims are drafted), then
 return your verdict with the same `follow_up_question`. Never call it for `ok` research."""
 
-LIMITS = AgentLimits(request_limit=4, timeout=90, budgets={"request_follow_up_research": 1})
+LIMITS = AgentLimits(request_limit=6, timeout=90, budgets={"request_follow_up_research": 1})
 
 agents = AgentFactory(
     "critic", CriticOutput, SYSTEM, tool_system=TOOL_SYSTEM, tools=[graph_tools.FOLLOW_UP, *context_tools.TOOLS]
@@ -41,9 +47,27 @@ agents = AgentFactory(
 agent = agents.get()
 
 
+def search_record(output: dict) -> str:
+    """One line from a research node's ``search_stats`` (absent for older versions or the single-shot path)."""
+    st = (output or {}).get("search_stats")
+    if not st:
+        return ""
+    q = st.get("queries") or {}
+    kinds = ", ".join(f"{k} {n}" for k, n in sorted(q.items())) or "none"
+    domains = st.get("domains_cited") or []
+    ended = {"rule": "stopped when rounds added little", "budget": "ran out of budget"}.get(st.get("stopped_by"), "")
+    return (
+        f"\nSearch record: {st.get('rounds', 0)} reflection round(s); web searches by kind: {kinds}; "
+        f"{st.get('docs_cited', 0)} of {st.get('docs_seen', 0)} documents seen are cited, from "
+        f"{len(domains)} site(s){': ' + ', '.join(domains[:8]) if domains else ''}"
+        f"{'; ' + ended if ended else ''}."
+    )
+
+
 def build_prompt(ctx: AgentContext) -> str:
     research = "\n\n".join(
-        f"### {p.title} ({p.key})\nQuestion: {p.config.get('question', '')}\n\n{p.output_text}" for p in ctx.parents
+        f"### {p.title} ({p.key})\nQuestion: {p.config.get('question', '')}{search_record(p.output)}\n\n{p.output_text}"
+        for p in ctx.parents
     )
     return f"## Goal\n{ctx.goal}\n\n## Research to critique\n{research or '(none)'}{format_instructions(ctx)}{format_steer(ctx)}"
 

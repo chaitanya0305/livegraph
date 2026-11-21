@@ -22,7 +22,15 @@ SYSTEM = """You are the Editor. Write a crisp, well-structured brief in markdown
 Rules: use only the claims provided; EXCLUDE struck claims entirely; state high-confidence claims (>= 0.75)
 plainly; hedge medium-confidence claims (0.4-0.75) with words like "likely"/"some evidence suggests";
 mention low-confidence claims (< 0.4) only as open questions. Reference claims inline as (C1), (C2).
+Never add facts, numbers, dates, names or causes that are not in the claims, even if you know them: every
+paragraph and bullet outside the headings and "Open questions" must rest on at least one referenced claim.
 Start with a one-paragraph bottom line, then sections, then "Open questions"."""
+
+# no judge ran (DISABLED_NODE_TYPES ablation): claims carry no confidence
+UNJUDGED = (
+    "Claims (not judged: no confidence scores; treat each as supported by its cited evidence, state it plainly "
+    "unless its wording is itself uncertain, and leave the confidence-based hedging rules aside)"
+)
 
 LIMITS = AgentLimits(request_limit=3, timeout=300)
 
@@ -35,8 +43,10 @@ agent = agents.get()
 
 def build_prompt(ctx: AgentContext) -> str:
     inputs = "\n\n".join(f"### {p.title} ({p.key})\n{p.output_text}" for p in ctx.parents)
+    judged = any(c.get("confidence") is not None for c in ctx.claims) or not ctx.claims
+    head = "Claims (with judged confidence)" if judged else UNJUDGED
     return (
-        f"## Goal\n{ctx.goal}\n\n## Claims (with judged confidence)\n{format_claims(ctx.claims)}\n\n"
+        f"## Goal\n{ctx.goal}\n\n## {head}\n{format_claims(ctx.claims)}\n\n"
         f"## Inputs\n{inputs or '(none)'}{format_instructions(ctx)}{format_steer(ctx)}"
     )
 

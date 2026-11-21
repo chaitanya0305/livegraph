@@ -1,0 +1,203 @@
+% LiveGraph: ACL-style system demonstration paper (4 pages + references).
+% Build: see README.md in this directory (needs acl.sty / acl_natbib.bst from acl-org/acl-style-files).
+\documentclass[11pt]{article}
+\usepackage[review]{acl}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{inconsolata}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{amsmath}
+
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+\newcommand{\sys}{\textsc{LiveGraph}}
+\newcommand{\results}{../results}
+% Figures: `report` writes SVG; convert to PDF for LaTeX (see README.md), else a placeholder box is shown.
+\newcommand{\resultfig}[2]{%
+  \IfFileExists{\results/figures/#1.pdf}%
+    {\includegraphics[width=#2]{\results/figures/#1.pdf}}%
+    {\fbox{\parbox{0.9\linewidth}{\centering\small Figure pending: \texttt{#1}}}}}
+\newcommand{\resulttable}[1]{%
+  \IfFileExists{\results/tables/#1.tex}{\input{\results/tables/#1.tex}}{\todo{table #1 pending}}}
+
+\title{\sys: A Live, Steerable Multi-Agent Research Canvas\\with Incremental Recompute}
+
+\author{Anonymous submission}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Deep-research agents turn a question into a cited report, but they run as opaque one-shot pipelines:
+users cannot see which evidence a claim rests on, how confident the system is in it, or fix one step
+without paying for, and waiting for, the whole run again. We present \sys{}, an open-source research
+canvas in which a planner agent builds the research workflow as a graph on screen, every step streams
+live, and the user can steer, edit, rerun, restore or veto any step, or distrust a source. Claims are
+contested by a prosecutor and a defender and scored by a judge with per-claim confidence. Every node
+output is an immutable version keyed by a hash of its inputs, so a change recomputes only the affected
+steps, and an early cutoff stops propagation when a recomputed output is unchanged. On \todo{N} research
+questions, \sys{} \todo{factual precision result} and updates a brief after a change at
+\todo{X}\% of the cost of starting over. Code, evaluation harness and data are released.
+\end{abstract}
+
+\section{Introduction}
+Systems that research a question on the web and write a cited report (``deep research'') are now
+widely used. Their interface, however, is a chat message in and a long document out. The intermediate
+work (which sub-questions were explored, what evidence was found, which claims were contested) is hidden
+or shown only as a scrolling log. When a reader spots a problem, such as a claim resting on an unreliable
+source, their only recourse is to re-prompt, which reruns the whole pipeline, costs as much as the first
+run, and may change parts of the report that were fine.
+
+We argue that a research report should behave like a build: a graph of steps with explicit inputs, where a
+change to one input rebuilds only what depends on it. \sys{} applies this idea to multi-agent research.
+Its contributions are:
+\begin{itemize}
+  \item \textbf{A live, inspectable workflow graph.} A planner agent creates the graph through tool calls,
+  so nodes appear on the canvas as it plans; each node streams its output and its tool activity, and a
+  timeline scrubber replays the full run from a persisted event log (\S\ref{sec:system}).
+  \item \textbf{Adversarial verification with calibrated confidence.} Extracted claims are attacked by a
+  prosecutor and defended by a defender; a judge, who can ask either side for rebuttals, assigns each claim
+  a confidence or strikes it, and the editor hedges or drops claims accordingly.
+  \item \textbf{Incremental recompute for agent workflows.} Node outputs are immutable versions keyed by an
+  input hash; steering, editing or distrusting a source invalidates only downstream nodes, and an early
+  cutoff on output hashes stops recomputation as soon as an output is unchanged.
+  \item \textbf{An open evaluation harness} (\texttt{lgeval}) measuring factual precision, citation quality,
+  calibration and recompute savings, with a pre-registered protocol (\S\ref{sec:eval}).
+\end{itemize}
+
+\section{System}
+\label{sec:system}
+\begin{figure}[t]
+  \centering
+  \fbox{\parbox{0.95\linewidth}{\centering\small \todo{Screenshot: canvas mid-run with claims panel}}}
+  \caption{The \sys{} canvas during a Living Brief run. \todo{annotate}}
+  \label{fig:screenshot}
+\end{figure}
+
+\paragraph{Living Brief workflow.} The user enters a goal and, optionally, uploads documents. A
+\emph{planner} agent decomposes the goal into 3--5 sub-questions and builds the graph with
+\texttt{add\_node}/\texttt{add\_edge} tools; each call is persisted and broadcast immediately, so the graph
+grows on screen. \emph{Researcher} agents search the uploaded corpus and the web, read sources and report
+findings tied to chunk ids; a \emph{critic} checks each researcher and can add a follow-up research node
+while the run is in progress. A \emph{claims} step extracts atomic claims, each with supporting chunks. A
+\emph{prosecutor} and a \emph{defender} argue against and for each claim with evidence, and a \emph{judge}
+reads both, may request targeted rebuttals, and outputs a confidence in $[0,1]$ per claim or strikes it.
+Finally an \emph{editor} writes the brief, citing claims inline, excluding struck claims and hedging
+low-confidence ones. Source text reaches models only as delimited data, and output validators reject
+citations to chunks the node never saw.
+
+\paragraph{Versioned nodes, input hashes and early cutoff.} Every node output is stored as an immutable
+version. Before a node runs, the engine computes an input hash over its type, configuration, the content
+hashes of its inputs, applicable steering text and, for corpus-reading nodes, a fingerprint of the
+documents in scope and their trust levels. If a version with that hash exists, it is reused without a model
+call. Each version also has an output hash over its content and cited evidence. When a recomputed node
+produces an output with the same hash as before, its descendants are not invalidated; those already marked
+stale re-hash, find their existing version and finish without running. This is the early-cutoff
+optimisation of build systems \citep{mokhov2018buildsystems} applied to LLM agents: an identical rerun
+stops at the rerun node. Web results are cached per run, so recomputation does not re-query the web
+unless the user asks for fresh sources.
+
+\paragraph{Steering and editing.} Any node can be steered with a natural-language instruction (a running
+node restarts with it; a finished node produces a new version), edited directly, rerun, restored to an
+earlier version or vetoed. Distrusting or pinning a document changes the corpus fingerprint of the nodes
+that read it, so exactly those nodes and their dependents recompute. An impact preview shows which nodes an
+action may touch before the user commits to it. Downstream agents can also request work from upstream
+nodes (for example, a judge asking a researcher to look again), which flows through the same mechanism.
+
+\paragraph{Multi-viewer and replay.} Every state change is an event written to Postgres before it is
+broadcast over WebSockets, so any number of viewers see the same run live, and the state at any point in
+time is a fold over the event log, which powers the timeline scrubber and version diffs.
+
+\paragraph{Implementation.} The backend is FastAPI with Pydantic AI agents over OpenRouter
+(any OpenAI-compatible model per role; in all experiments every agent runs on \texttt{deepseek-v4.1-flash}),
+Postgres with pgvector for the corpus; the frontend is Next.js with React Flow. A typical run costs about
+\$0.01 \todo{update with measured pilot cost}. \todo{link to code and demo video}
+
+\section{Evaluation}
+\label{sec:eval}
+We test three claims (protocol in the repository, \texttt{docs/EVAL.md}): (A) briefs are more factual and
+better cited than ablations and a single-agent baseline with the same models and tools; (B) judge
+confidence is calibrated; (C) updates after a change cost a fraction of starting over without quality
+loss. We use \todo{N} custom research questions and \todo{N} questions from FRAMES
+\citep{krishna2024frames}, three repeats per system. Factual precision follows FActScore and SAFE
+\citep{min2023factscore,wei2024longform}, citation precision/recall follows ALCE \citep{gao2023alce}, and
+short answers are graded as in SimpleQA \citep{wei2024simpleqa}. Scores come from an LLM judge of a
+different model family than \sys{}'s models, with position-swapped pairwise comparisons
+\citep{zheng2023judging} and a human spot-check of \todo{X}\% of decisions (Cohen's $\kappa$ = \todo{}).
+CIs are 95\% bootstrap intervals over questions.
+
+\resulttable{quality}
+
+\paragraph{Quality (A).} \todo{Table~\ref{tab:quality}: summarise full vs.\ ablations and baseline.}
+\resulttable{pairwise}
+
+\paragraph{Calibration (B).} \todo{Brier, ECE, AUROC from Table~\ref{tab:calibration}; Figure~\ref{fig:reliability}.}
+\resulttable{calibration}
+\begin{figure}[t]
+  \centering
+  \resultfig{reliability}{0.85\linewidth}
+  \caption{Reliability diagram of judge confidence (marker area $\propto$ claims per bin).}
+  \label{fig:reliability}
+\end{figure}
+
+\paragraph{Incremental recompute (C).} \todo{Table~\ref{tab:recompute}: cost/time \% per mutation, nodes reused.}
+\resulttable{recompute}
+\begin{figure}[t]
+  \centering
+  \resultfig{recompute_cost}{0.85\linewidth}
+  \caption{Mean cost of an update vs.\ starting over, per mutation.}
+  \label{fig:recompute}
+\end{figure}
+
+\paragraph{Cost of the study.} The full evaluation cost \todo{\$X} (Table~\ref{tab:study_cost}).
+\resulttable{study_cost}
+
+\section{Related Work}
+\paragraph{Deep research and report generation.} STORM \citep{shao2024storm} generates Wikipedia-like
+articles by simulating perspective-guided conversations to collect sources before outlining and writing.
+Commercial deep-research products follow the same one-shot pattern. Benchmarks such as FRAMES
+\citep{krishna2024frames} and BrowseComp \citep{wei2025browsecomp} evaluate retrieval and browsing on
+questions with short answers. \sys{} focuses instead on the interaction model: making each step visible,
+steerable and cheap to revise.
+
+\paragraph{Debate, critique and self-refinement.} Debate was proposed as a way for a weaker judge to
+supervise stronger agents \citep{irving2018debate}, and multi-agent debate improves factuality and
+reasoning \citep{du2024debate}. Self-Refine \citep{madaan2023selfrefine} and Reflexion
+\citep{shinn2023reflexion} improve outputs through self-feedback. \sys{} uses role-specialised
+prosecutor and defender agents with a judge that outputs per-claim confidence, and exposes the debate in
+the interface rather than only using its outcome.
+
+\paragraph{Evaluating factuality and citations.} FActScore \citep{min2023factscore} and SAFE
+\citep{wei2024longform} decompose long-form text into atomic facts; ALCE \citep{gao2023alce} measures
+citation precision and recall; LLM-as-a-judge \citep{zheng2023judging} enables pairwise comparison but
+exhibits position and self-preference biases \citep{panickssery2024selfpref}. We measure calibration with
+Brier score and ECE \citep{brier1950,naeini2015ece,guo2017calibration}.
+
+\paragraph{Incremental computation.} Adapton \citep{hammer2014adapton} provides demand-driven
+incremental computation; build systems such as those formalised by \citet{mokhov2018buildsystems} rebuild
+only out-of-date targets and use early cutoff when a rebuilt target is unchanged. We apply these ideas to
+a graph whose steps are non-deterministic LLM agents, where reuse is keyed on input hashes and cutoff on
+output hashes.
+
+\section*{Limitations}
+LLM outputs are non-deterministic, so ``unchanged'' is detected by exact output hashes; a semantically
+equivalent but reworded output still propagates. Our quality metrics rely on LLM judges, which we mitigate
+but cannot eliminate with a cross-family judge and a human spot-check. Factual precision is checked against
+retrieved evidence, so errors present in sources are not caught. The evaluation uses \todo{N} questions in
+English with one model configuration, and web search results drift over time. The user study is small
+(\todo{n} participants) and formative. Commercial deep-research systems change without notice and are
+compared only descriptively.
+
+\section*{Ethics Statement}
+\sys{} retrieves and summarises web content; briefs can contain errors, and confidence scores can be
+miscalibrated, so the interface shows evidence and confidence rather than presenting outputs as fact.
+Retrieved content is treated as data, not instructions, to reduce prompt-injection risk, but this is not a
+guarantee. The user study collected informed consent, stored only pseudonymous interaction logs, and
+\todo{IRB/ethics approval status}. We report the monetary cost of all experiments.
+
+\bibliography{refs}
+
+\end{document}

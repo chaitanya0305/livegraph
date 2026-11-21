@@ -14,6 +14,7 @@ import html
 import ipaddress
 import re
 import socket
+from typing import Any, Literal
 from urllib.parse import urlparse
 from uuid import UUID
 
@@ -27,6 +28,7 @@ from livegraph.agents.deps import NodeDeps
 from livegraph.agents.guard import ToolOut, run_tool, wrap_chunks
 from livegraph.config import settings
 from livegraph.rag.models import Document, WebCache
+from livegraph.rag.schemas import RetrievedChunk
 
 _fallback_lock = asyncio.Lock()  # deps without a scheduler (smoke script)
 
@@ -35,16 +37,54 @@ def _web_lock(deps: NodeDeps) -> asyncio.Lock:
     return getattr(deps.sched, "web_lock", None) or _fallback_lock
 
 
-def norm_query(q: str) -> str:
-    return " ".join(q.lower().split())
+WEB_KINDS = ("explore", "target", "challenge")
+WEB_CATEGORIES = ("research paper", "news", "pdf", "company", "financial report")
+WEB_K = 5  # chunks web_search returns
+PER_DOC, PER_DOMAIN = 2, 2  # at most this many of them from one page / one site (WEB_PAGE_TEXT)
 
 
-async def web_doc_ids(deps: NodeDeps, query: str) -> tuple[list[UUID], str]:
+def norm_query(q: str, *, since_year: int | None = None, category: str | None = None) -> str:
+    """Web-cache key: the normalized query, plus its filters when set (plain queries keep their old keys)."""
+    key = " ".join(q.lower().split())
+    if since_year:
+        key += f"|since={int(since_year)}"
+    if category:
+        key += f"|cat={category}"
+    return key
+
+
+def domain_of(url: str | None) -> str:
+    host = (urlparse(url or "").hostname or "").lower()
+    return host.removeprefix("www.")
+
+
+def diversify(chunks: list[RetrievedChunk], k: int, per_doc: int = PER_DOC, per_domain: int = PER_DOMAIN) -> list[RetrievedChunk]:
+    """The best ``k`` chunks (input is best-first) with at most ``per_doc`` per document and ``per_domain`` per
+    site, so one long page cannot fill the result; backfills from the rest if the caps leave slots empty."""
+    picked: list[RetrievedChunk] = []
+    docs: dict[str, int] = {}
+    sites: dict[str, int] = {}
+    for c in chunks:
+        d, site = str(c.document_id), domain_of(c.source_url) or str(c.document_id)
+        if docs.get(d, 0) >= per_doc or sites.get(site, 0) >= per_domain:
+            continue
+        picked.append(c)
+        docs[d] = docs.get(d, 0) + 1
+        sites[site] = sites.get(site, 0) + 1
+        if len(picked) == k:
+            return picked
+    rest = [c for c in chunks if c not in picked]
+    return picked + rest[: k - len(picked)]
+
+
+async def web_doc_ids(
+    deps: NodeDeps, query: str, *, since_year: int | None = None, category: str | None = None
+) -> tuple[list[UUID], str]:
     """Document ids for a web query: cache first (unless forced), else the network (if allowed).
 
     Returns (doc_ids, source) with source in cache|web|offline|none.
     """
-    qn = norm_query(query)
+    qn = norm_query(query, since_year=since_year, category=category)
     async with deps.session() as s:
         if not deps.force:
             row = await s.scalar(select(WebCache).where(WebCache.run_id == deps.run_id, WebCache.query_norm == qn))
@@ -52,7 +92,7 @@ async def web_doc_ids(deps: NodeDeps, query: str) -> tuple[list[UUID], str]:
                 return [UUID(x) for x in row.doc_ids], "cache"
     if not (deps.force or deps.web_live):
         return [], "offline"
-    citations = await rag.fetch_citations(query)
+    citations = await rag.fetch_citations(query, since_year=since_year, category=category)
     if not citations:
         return [], "none"
     deps.guard()
@@ -118,16 +158,30 @@ async def read_source(ctx: RunContext[NodeDeps], chunk_id: str) -> str:
     return await run_tool(ctx, "read_source", {"chunk_id": chunk_id}, impl)
 
 
-async def web_search(ctx: RunContext[NodeDeps], query: str) -> str:
-    """Search the web; the cited pages are added to the run's documents and their best chunks returned.
+async def web_search(
+    ctx: RunContext[NodeDeps],
+    query: str,
+    kind: Literal["explore", "target", "challenge"] = "explore",
+    since_year: int | None = None,
+    category: Literal["research paper", "news", "pdf", "company", "financial report"] | None = None,
+) -> str:
+    """Search the web; the pages found are added to the run's documents and their most relevant passages returned.
 
     Args:
-        query: a focused web search query.
+        query: a short natural-language question or description of the page you want (not a keyword list).
+        kind: explore (map the topic), target (fill one specific gap) or challenge (look for criticism,
+            limitations or evidence against the current answer).
+        since_year: only pages published in or after this year (for recent developments).
+        category: restrict to one kind of source, e.g. "research paper" or "news".
     """
+    kind = kind if kind in WEB_KINDS else "explore"
+    category = category if category in WEB_CATEGORIES else None
+    since_year = int(since_year) if since_year else None
 
     async def impl() -> ToolOut:
         deps = ctx.deps
-        doc_ids, source = await web_doc_ids(deps, query)
+        deps.query_kinds[kind] = deps.query_kinds.get(kind, 0) + 1
+        doc_ids, source = await web_doc_ids(deps, query, since_year=since_year, category=category)
         if not doc_ids:
             reason = {
                 "offline": "web search is only available on a fresh run or a rerun; use search_documents",
@@ -135,7 +189,11 @@ async def web_search(ctx: RunContext[NodeDeps], query: str) -> str:
             }.get(source, "no web results")
             return ToolOut(text=reason, summary="no web results")
         async with deps.session() as s:
-            chunks = await rag.search(s, run_id=deps.run_id, query=query, k=5, document_ids=doc_ids)
+            if settings.web_page_text:  # whole pages: rank across them, then spread over pages and sites
+                found = await rag.search(s, run_id=deps.run_id, query=query, k=WEB_K * 3, document_ids=doc_ids)
+                chunks = diversify(found, WEB_K)
+            else:
+                chunks = await rag.search(s, run_id=deps.run_id, query=query, k=WEB_K, document_ids=doc_ids)
         deps.add_chunks(chunks, "web")
         tag = " (cached)" if source == "cache" else ""
         if not chunks:
@@ -144,7 +202,14 @@ async def web_search(ctx: RunContext[NodeDeps], query: str) -> str:
             text=wrap_chunks(chunks), summary=f"{len(doc_ids)} pages, {len(chunks)} chunks{tag}", chunks=chunks
         )
 
-    return await run_tool(ctx, "web_search", {"query": query}, impl)
+    args: dict[str, Any] = {"query": query}
+    if kind != "explore":  # only non-defaults: a plain query keeps its one-line trace summary
+        args["kind"] = kind
+    if since_year:
+        args["since_year"] = since_year
+    if category:
+        args["category"] = category
+    return await run_tool(ctx, "web_search", args, impl)
 
 
 # ---------------------------------------------------------------- fetch_page (FETCH_PAGE=true only)
@@ -247,7 +312,12 @@ async def _only_if_fetch_enabled(ctx: RunContext[NodeDeps], tool_def: ToolDefini
     return tool_def if settings.fetch_page else None
 
 
+async def _only_if_plan_web(ctx: RunContext[NodeDeps], tool_def: ToolDefinition) -> ToolDefinition | None:
+    return tool_def if settings.plan_web_search else None
+
+
 SEARCH = Tool(search_documents, takes_ctx=True)
 READ = Tool(read_source, takes_ctx=True)
 WEB = Tool(web_search, takes_ctx=True)
+PLAN_WEB = Tool(web_search, takes_ctx=True, prepare=_only_if_plan_web)  # the planner's scouting (PLAN_WEB_SEARCH)
 FETCH = Tool(fetch_page, takes_ctx=True, prepare=_only_if_fetch_enabled)

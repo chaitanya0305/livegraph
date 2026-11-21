@@ -1,0 +1,31 @@
+{
+  "generated_at": "2026-10-22T16:42:39+00:00",
+  "inputs": {
+    "files": [],
+    "skipped_lines": 0,
+    "counts": {
+      "runs": 0,
+      "recompute": 0,
+      "scores": 0,
+      "pairwise": 0,
+      "claim_labels": 0
+    },
+    "models": {},
+    "git_sha": [],
+    "judge_model": null,
+    "judge_models_seen": []
+  },
+  "quality": {},
+  "pairwise": {},
+  "calibration": {},
+  "recompute": {},
+  "study_cost": {},
+  "notes": [
+    "quality: omitted (no `scores.jsonl` or successful `runs.jsonl` records)",
+    "pairwise: omitted (no `pairwise.jsonl` records involving `full`)",
+    "calibration: omitted (no `claim_labels.jsonl` records and no brier/ece scores)",
+    "recompute: omitted (no `recompute.jsonl` records)",
+    "study_cost: omitted (no records with measured cost)"
+  ],
+  "figures": []
+}

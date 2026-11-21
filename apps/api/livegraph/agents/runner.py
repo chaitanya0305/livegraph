@@ -44,6 +44,8 @@ async def run_agent(
     debounce: float | None = 0.02,  # partial-validation cadence; the bus still batches deltas at ~50ms
 ) -> AgentResult:
     sent = ""
+    if limits is not None and limits.request_limit is not None and hasattr(deps, "request_cap"):
+        deps.request_cap = limits.request_limit  # tools wind down before the cap (base.wind_down)
 
     async def _run() -> tuple[Any, RunUsage]:
         nonlocal sent
